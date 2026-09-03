@@ -3,6 +3,7 @@
 
 pub mod word;
 pub mod town;
+pub mod log;
 pub mod residents;
 pub mod square;
 pub mod paths;

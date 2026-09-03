@@ -7,7 +7,7 @@
 //!   town listen       hear the words
 
 // the engine lives in the library crate (src/lib.rs); the binary just orchestrates it.
-use town::town::{compact_log, Town};
+use town::town::Town;
 use town::{paths, residents, square};
 
 fn main() {
@@ -44,7 +44,7 @@ fn main() {
             }
         };
         let town = Town::new();
-        compact_log(&town, 128 * 1024); // keep the past log bounded; only recent facts feed past()
+        town.compact(128 * 1024); // keep the past log bounded; only recent facts feed past()
         let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
         if let Err(e) = residents::install(&lua, &town) {
             eprintln!("town: {e}");
