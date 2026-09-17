@@ -50,6 +50,10 @@ pub fn install(lua: &Lua, town: &Rc<Town>) -> mlua::Result<()> {
 pub fn open(lua: &Lua, town: &Rc<Town>) -> mlua::Result<()> {
     town.age.set(town.age.get() + 1);
     let age = town.age.get();
+    // retire the previous generation's watch tasks — they can't reliably notice a reopen themselves
+    for h in town.watchers.borrow_mut().drain(..) {
+        h.abort();
+    }
 
     // the composition vocabulary first, so residents can be written with it
     if let Ok(src) = std::fs::read_to_string(paths::lib()) {
@@ -87,9 +91,9 @@ fn wire(lua: &Lua, town: &Rc<Town>, name: &str, age: u64) -> mlua::Result<()> {
     if let Some(watch) = spec.get::<Option<Table>>("watch")? {
         for pair in watch.pairs::<String, String>() {
             let (kind, path) = pair?;
-            let town = town.clone();
+            let town_watch = town.clone();
             let dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
-            tokio::task::spawn_local(async move {
+            let handle = tokio::task::spawn_local(async move {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut watcher = match notify::recommended_watcher(move |_| { let _ = tx.send(()); }) {
                     Ok(w) => w,
@@ -104,20 +108,18 @@ fn wire(lua: &Lua, town: &Rc<Town>, name: &str, age: u64) -> mlua::Result<()> {
                 // a file greets with its current content (so theme is set on boot); a directory doesn't
                 if !dir {
                     if let Ok(text) = std::fs::read_to_string(&path) {
-                        town.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text) });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text) });
                     }
                 }
                 while rx.recv().await.is_some() {
-                    if age < town.age.get() {
-                        break; // a newer generation replaced us; dropping `watcher` stops it
-                    }
                     if dir {
-                        town.talk(Word { kind: kind.clone(), tense: Tense::Past, body: Value::Null });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Past, body: Value::Null });
                     } else if let Ok(text) = std::fs::read_to_string(&path) {
-                        town.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text) });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text) });
                     }
                 }
             });
+            town.watchers.borrow_mut().push(handle);
         }
     }
 

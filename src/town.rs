@@ -16,6 +16,7 @@ pub struct Town {
     pub words: broadcast::Sender<Word>,            // every word, to all who listen
     pub age: Cell<u64>,                            // bumped on reopen; old listeners retire
     pub log: std::path::PathBuf,                   // the fact log this town folds + appends
+    pub watchers: RefCell<Vec<tokio::task::JoinHandle<()>>>, // watch tasks; aborted on reopen
 }
 
 impl Town {
@@ -35,6 +36,7 @@ impl Town {
             words,
             age: Cell::new(0),
             log,
+            watchers: RefCell::new(Vec::new()),
         })
     }
 
