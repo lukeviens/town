@@ -11,6 +11,13 @@ pub struct Word {
     pub tense: Tense,
     #[serde(default)]
     pub body: Value,
+    /// When it was said, ms since the epoch; the town stamps it as it talks. 0 = not yet said.
+    #[serde(default, skip_serializing_if = "unsaid")]
+    pub at: u64,
+}
+
+fn unsaid(at: &u64) -> bool {
+    *at == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

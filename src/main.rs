@@ -81,7 +81,7 @@ fn word_line(args: &[String]) -> String {
                     body.insert(k.to_string(), serde_json::Value::String(v.to_string()));
                 }
             }
-            Word { kind: kind.clone(), tense, body: serde_json::Value::Object(body) }.to_line()
+            Word { kind: kind.clone(), tense, body: serde_json::Value::Object(body), at: 0 }.to_line()
         }
         None => String::new(),
     }

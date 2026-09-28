@@ -42,7 +42,13 @@ impl Town {
 
     // Talk a word: only facts fold into the present and land in the log (events and
     // intentions are transient — nothing ever reads them back); every word is sent on.
-    pub fn talk(&self, word: Word) {
+    pub fn talk(&self, mut word: Word) {
+        if word.at == 0 {
+            word.at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+        }
         if word.is_fact() {
             self.present
                 .borrow_mut()
@@ -67,6 +73,7 @@ impl Town {
                 kind: k.clone(),
                 tense: Tense::Present,
                 body: body.clone(),
+                at: 0,
             })
             .collect()
     }
@@ -154,12 +161,14 @@ mod tests {
             kind: "favourites".into(),
             tense: Tense::Present,
             body: serde_json::json!({ "1": { "app": "X" } }),
+            at: 0,
         });
         for i in 0..50u32 {
             town.talk(Word {
                 kind: "theme".into(),
                 tense: Tense::Present,
                 body: serde_json::json!({ "bg": format!("#{i:06x}") }),
+                at: 0,
             });
         }
         let before = town.present.borrow().clone();
@@ -178,9 +187,9 @@ mod tests {
     fn talk_folds_facts_only() {
         let path = tmp_log();
         let town = Town::at(path.clone());
-        town.talk(Word { kind: "theme".into(), tense: Tense::Present, body: serde_json::json!({"bg":"#111"}) });
-        town.talk(Word { kind: "key".into(), tense: Tense::Past, body: serde_json::json!({"press":"f"}) });
-        town.talk(Word { kind: "pick".into(), tense: Tense::Future, body: serde_json::json!({"what":"apps"}) });
+        town.talk(Word { kind: "theme".into(), tense: Tense::Present, body: serde_json::json!({"bg":"#111"}), at: 0 });
+        town.talk(Word { kind: "key".into(), tense: Tense::Past, body: serde_json::json!({"press":"f"}), at: 0 });
+        town.talk(Word { kind: "pick".into(), tense: Tense::Future, body: serde_json::json!({"what":"apps"}), at: 0 });
         assert_eq!(town.present.borrow()["theme"]["bg"], "#111");
         assert!(!town.present.borrow().contains_key("key"));
         assert!(!town.present.borrow().contains_key("pick"));

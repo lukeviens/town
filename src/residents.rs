@@ -108,14 +108,14 @@ fn wire(lua: &Lua, town: &Rc<Town>, name: &str, age: u64) -> mlua::Result<()> {
                 // a file greets with its current content (so theme is set on boot); a directory doesn't
                 if !dir {
                     if let Ok(text) = std::fs::read_to_string(&path) {
-                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text) });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text), at: 0 });
                     }
                 }
                 while rx.recv().await.is_some() {
                     if dir {
-                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Past, body: Value::Null });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Past, body: Value::Null, at: 0 });
                     } else if let Ok(text) = std::fs::read_to_string(&path) {
-                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text) });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text), at: 0 });
                     }
                 }
             });
@@ -136,7 +136,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, name: &str, age: u64) -> mlua::Result<()> {
                 // said before it woke isn't lost
                 let greeting = town.present.borrow().get(&kind).cloned();
                 if let Some(body) = greeting {
-                    say(&lua, &handler, &town, &Word { kind: kind.clone(), tense: Tense::Present, body });
+                    say(&lua, &handler, &town, &Word { kind: kind.clone(), tense: Tense::Present, body, at: 0 });
                 }
                 loop {
                     if age < town.age.get() {
@@ -145,7 +145,8 @@ fn wire(lua: &Lua, town: &Rc<Town>, name: &str, age: u64) -> mlua::Result<()> {
                     match words.recv().await {
                         // re-check age AFTER waking: a reopen may have retired us WHILE we were
                         // parked in recv, and we must not dispatch one last word (double pickers).
-                        Ok(w) if age >= town.age.get() && w.kind == kind => say(&lua, &handler, &town, &w),
+                        // "*" listens to every kind
+                        Ok(w) if age >= town.age.get() && (kind == "*" || w.kind == kind) => say(&lua, &handler, &town, &w),
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,

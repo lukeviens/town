@@ -37,7 +37,7 @@ fn arb_word() -> impl Strategy<Value = Word> {
         arb_tense(),
         arb_body(),
     )
-        .prop_map(|(kind, tense, body)| Word { kind, tense, body })
+        .prop_map(|(kind, tense, body)| Word { kind, tense, body, at: 0 })
 }
 
 // An independent reference for the fold: last present, non-empty-kind word wins.
