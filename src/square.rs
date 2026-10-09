@@ -1,4 +1,4 @@
-//! The square: how other runtimes (nvim, HS) reach town — talk words in, or listen
+//! The square: how other runtimes reach town — talk words in, or listen
 //! for the news. `reach` is the same two moves from a shell.
 
 use std::rc::Rc;

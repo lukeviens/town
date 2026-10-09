@@ -7,3 +7,4 @@ pub mod log;
 pub mod residents;
 pub mod square;
 pub mod paths;
+pub mod work;

@@ -45,6 +45,18 @@ fn main() {
         };
         let town = Town::new();
         town.compact(128 * 1024); // keep the past log bounded; only recent facts feed past()
+        // say whether the core running is the core on disk, so a forgotten rebuild is visible
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(stale) = paths::stale(&exe, &paths::src()) {
+                town.talk(town::word::Word {
+                    kind: "build".into(),
+                    tense: town::word::Tense::Present,
+                    body: serde_json::json!({ "stale": stale }),
+                    at: 0,
+                });
+            }
+        }
+        town::work::obey(&town); // future `work` is run outside, off the runtime
         let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
         if let Err(e) = residents::install(&lua, &town) {
             eprintln!("town: {e}");

@@ -16,7 +16,9 @@ pub struct Town {
     pub words: broadcast::Sender<Word>,            // every word, to all who listen
     pub age: Cell<u64>,                            // bumped on reopen; old listeners retire
     pub log: std::path::PathBuf,                   // the fact log this town folds + appends
-    pub watchers: RefCell<Vec<tokio::task::JoinHandle<()>>>, // watch tasks; aborted on reopen
+    pub watchers: RefCell<Vec<tokio::task::JoinHandle<()>>>, // watch + join tasks; aborted on reopen
+    /// kind → the stdin of a program town has joined; `work { at = kind }` writes a line to it.
+    pub joins: RefCell<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
 impl Town {
@@ -37,6 +39,7 @@ impl Town {
             age: Cell::new(0),
             log,
             watchers: RefCell::new(Vec::new()),
+            joins: RefCell::new(std::collections::HashMap::new()),
         })
     }
 
