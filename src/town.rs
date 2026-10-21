@@ -132,8 +132,7 @@ mod tests {
         ))
     }
 
-    // Regression for the tail_lines UTF-8 bug: a byte window that splits a multibyte char must
-    // still yield the whole tail (the old read_to_string returned empty and it was swallowed).
+    // A byte window that splits a multibyte char must still yield the whole tail.
     #[test]
     fn tail_survives_a_utf8_split_at_the_window_edge() {
         let path = tmp_log();
