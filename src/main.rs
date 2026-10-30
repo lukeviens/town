@@ -90,6 +90,17 @@ fn word_line(args: &[String]) -> String {
             let mut body = serde_json::Map::new();
             for kv in &rest[1..] {
                 if let Some((k, v)) = kv.split_once('=') {
+                    // Tense is the word's, never the body's. Written here it is silently ignored:
+                    // the word goes out as a present fact, folds into the present forever, and
+                    // carries the tense it meant as data. (`kind` and `at` are real body fields —
+                    // `place {kind=session}`, `key {at=leader}` — so only this one is a mistake.)
+                    if k == "tense" {
+                        eprintln!(
+                            "town: tense belongs to the word, not its body.\n\
+                             town talk [past|present|future] <kind> key=value …"
+                        );
+                        std::process::exit(2);
+                    }
                     body.insert(k.to_string(), serde_json::Value::String(v.to_string()));
                 }
             }
