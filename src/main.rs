@@ -5,6 +5,7 @@
 //!   town              open the town (run its programs)
 //!   town talk <json>  say a word
 //!   town listen       hear the words
+//!   town ask <json>   say a word and wait for its answer
 
 // the engine lives in the library crate (src/lib.rs); the binary just orchestrates it.
 use town::town::Town;
@@ -15,10 +16,16 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("talk") => return square::reach("talk", Some(&word_line(&args[2..]))),
         Some("listen") => return square::reach("listen", None),
+        // ask: say a word, wait for its answer, print it. TOWN_WAIT seconds (default 1800), else exit 1.
+        Some("ask") => {
+            let wait = std::env::var("TOWN_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
+            let answered = square::ask(&word_line(&args[2..]), std::time::Duration::from_secs(wait));
+            std::process::exit(if answered { 0 } else { 1 });
+        }
         None => {} // no verb → open the town below
         Some(other) => {
             // never boot on a stray arg — that would remove the square and spawn a rogue server
-            eprintln!("town: unknown command '{other}' (expected: talk, listen, or nothing to open)");
+            eprintln!("town: unknown command '{other}' (expected: talk, listen, ask, or nothing to open)");
             return;
         }
     }
