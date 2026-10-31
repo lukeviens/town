@@ -19,6 +19,11 @@ pub fn square() -> PathBuf {
     cache().join("square.sock")
 }
 
+/// which program the running town is: its binary's sha256 and its pid, written as it starts
+pub fn running() -> PathBuf {
+    cache().join("running")
+}
+
 pub fn past() -> PathBuf {
     cache().join("past.log")
 }

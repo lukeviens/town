@@ -63,6 +63,14 @@ fn main() {
                 });
             }
         }
+        // say which program this is, by the same `shasum` a build uses, so the build can tell the
+        // town running is the one it made — not an older one still in memory, nor one launchd refused
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(out) = std::process::Command::new("/usr/bin/shasum").args(["-a", "256"]).arg(&exe).output() {
+                let hash = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
+                std::fs::write(paths::running(), format!("{hash} {}\n", std::process::id())).ok();
+            }
+        }
         town::work::obey(&town); // future `work` is run outside, off the runtime
         let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
         if let Err(e) = residents::install(&lua, &town) {
