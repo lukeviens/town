@@ -71,6 +71,7 @@ pub fn open(lua: &Lua, town: &Rc<Town>) -> mlua::Result<()> {
         h.abort();
     }
     town.joins.borrow_mut().clear();
+    *town.inside.borrow_mut() = Town::machinery();
 
     // the composition vocabulary first, so residents can be written with it
     if let Ok(src) = std::fs::read_to_string(paths::lib()) {
@@ -117,6 +118,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
     if let Some(watch) = spec.get::<Option<Table>>("watch")? {
         for pair in watch.pairs::<String, String>() {
             let (kind, path) = pair?;
+            town.inside.borrow_mut().insert(kind.clone());   // a watch speaks for the file, not for anyone
             let town_watch = town.clone();
             let dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
             let handle = tokio::task::spawn_local(async move {
@@ -179,6 +181,14 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
             });
         }
     }
+    // own: kinds this resident alone makes — a translator's reading of its program. Refused from
+    // the square, so no one outside can say them in its place.
+    if let Some(own) = spec.get::<Option<Table>>("own")? {
+        for kind in own.sequence_values::<String>().filter_map(Result::ok) {
+            town.inside.borrow_mut().insert(kind);
+        }
+    }
+
     // join: a program town keeps talking to, the way `watch` is a file it keeps reading. Every
     // line the program says is a past word of the declared kind; `work { at = <kind> }` writes a
     // line back. What the lines MEAN is the resident's — the engine knows no protocol.
@@ -192,6 +202,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
             let town_join = town.clone();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             town.joins.borrow_mut().insert(kind.clone(), tx);
+            town.inside.borrow_mut().insert(kind.clone());   // a joined program speaks only through town
             let handle = tokio::task::spawn_local(async move {
                 loop {
                     // kill_on_drop: a reopen aborts this task, and the program must go with it or
@@ -269,5 +280,45 @@ fn say(lua: &Lua, handler: &Function, town: &Town, w: &Word) {
     match lua.from_value::<Word>(said) {
         Ok(word) => town.talk(word),
         Err(e) => eprintln!("town: resident returned a non-word handling '{}': {e}", w.kind),
+    }
+}
+
+#[cfg(test)]
+mod inside {
+    use super::*;
+    use crate::word::Tense;
+
+    fn word(kind: &str) -> Word {
+        Word { kind: kind.into(), tense: Tense::Future, body: Value::Null, at: 0 }
+    }
+
+    // what a resident watches or calls its own is said only by town: the square refuses it, and
+    // still takes what a surface may say. A reopen starts the set again from town's own machinery.
+    #[test]
+    fn the_square_refuses_what_only_town_makes() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let dir = std::env::temp_dir().join(format!("town-inside-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("colors");
+            std::fs::write(&file, "bg=#000\n").unwrap();
+            let resident = dir.join("r.lua");
+            std::fs::write(&resident, format!(
+                "return {{ listen = {{}}, talk = function() end, watch = {{ colors = {:?} }}, own = {{ \"handle\" }} }}",
+                file.to_string_lossy()
+            )).unwrap();
+
+            let town = Town::at(dir.join("past.log"));
+            assert!(!town.admits(&word("work")), "town's own commands, from the start");
+            wire(&Lua::new(), &town, &resident, 0).unwrap();
+            assert!(!town.admits(&word("colors")), "a watch speaks for its file");
+            assert!(!town.admits(&word("handle")), "a resident's own");
+            for k in ["place", "focus", "review", "tabs", "key"] {
+                assert!(town.admits(&word(k)), "a surface may say {k}");
+            }
+            *town.inside.borrow_mut() = Town::machinery();   // as a reopen does
+            assert!(town.admits(&word("handle")) && !town.admits(&word("work")));
+            std::fs::remove_dir_all(&dir).ok();
+        });
     }
 }

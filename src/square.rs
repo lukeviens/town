@@ -38,7 +38,7 @@ async fn at_square(conn: UnixStream, town: Rc<Town>) {
             let heard = async move {
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(word) = Word::from_line(&line) {
-                        talker.talk(word);
+                        said(&talker, word);
                     }
                 }
             };
@@ -50,14 +50,23 @@ async fn at_square(conn: UnixStream, town: Rc<Town>) {
         }
         _ => {
             if let Some(word) = Word::from_line(&first) {
-                town.talk(word);
+                said(&town, word);
             }
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(word) = Word::from_line(&line) {
-                    town.talk(word);
+                    said(&town, word);
                 }
             }
         }
+    }
+}
+
+// a word from someone at the square: said in town, unless it is one only town itself makes
+fn said(town: &Town, word: Word) {
+    if town.admits(&word) {
+        town.talk(word);
+    } else {
+        eprintln!("town: refused a `{}` word from the square — only town makes those", word.kind);
     }
 }
 

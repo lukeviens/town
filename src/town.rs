@@ -19,6 +19,10 @@ pub struct Town {
     pub watchers: RefCell<Vec<tokio::task::JoinHandle<()>>>, // watch + join tasks; aborted on reopen
     /// kind → the stdin of a program town has joined; `work { at = kind }` writes a line to it.
     pub joins: RefCell<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// kinds only town itself makes — `work`, what its watches and joins say, and what a resident
+    /// declares its own. The square refuses them from outside: whoever connects may say what they
+    /// know, but not make town run something, nor put words in its machinery's mouth.
+    pub inside: RefCell<std::collections::HashSet<String>>,
 }
 
 impl Town {
@@ -40,7 +44,18 @@ impl Town {
             log,
             watchers: RefCell::new(Vec::new()),
             joins: RefCell::new(std::collections::HashMap::new()),
+            inside: RefCell::new(Self::machinery()),
         })
+    }
+
+    /// what town's own machinery says before any resident adds to it: the commands it runs
+    pub fn machinery() -> std::collections::HashSet<String> {
+        ["work".to_string()].into_iter().collect()
+    }
+
+    /// may a word from outside be said in town? Not one only town itself makes.
+    pub fn admits(&self, w: &Word) -> bool {
+        !self.inside.borrow().contains(&w.kind)
     }
 
     // Talk a word: only facts fold into the present and land in the log (events and

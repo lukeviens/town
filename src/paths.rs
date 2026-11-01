@@ -7,11 +7,15 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").expect("town needs $HOME set"))
 }
 
+/// town's own folder: the square, the log, what the surfaces keep. Yours alone (700), whatever
+/// each file inside is — history and sessions are no one else's to read.
 fn cache() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let d = home().join(".cache/town");
     if let Err(e) = std::fs::create_dir_all(&d) {
         eprintln!("town: cannot create {}: {e}", d.display());
     }
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).ok();
     d
 }
 
