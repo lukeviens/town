@@ -30,11 +30,11 @@ pub fn obey(town: &Rc<Town>) {
 }
 
 async fn done(town: Rc<Town>, cmd: String, body: Value) {
-    // `at` names a program town has joined: write the line to it rather than spawn a shell. The
+    // `to` names a program town has joined: write the line to it rather than spawn a shell. The
     // answer, if there is one, comes back on that join as its own word — this says only that the
     // line went out.
-    if let Some(at) = body.get("at").and_then(Value::as_str).map(String::from) {
-        let sent = town.joins.borrow().get(&at).map(|tx| tx.send(cmd).is_ok()).unwrap_or(false);
+    if let Some(to) = body.get("to").and_then(Value::as_str).map(String::from) {
+        let sent = town.joins.borrow().get(&to).map(|tx| tx.send(cmd).is_ok()).unwrap_or(false);
         // the caller's fields ride back, as they do for a shell. A line is written in the order it
         // was sent, and that order is the only thing that can match a reply to what asked for it.
         let mut body = body;
@@ -43,7 +43,7 @@ async fn done(town: Rc<Town>, cmd: String, body: Value) {
             m.insert("ms".into(), json!(0));
             m.insert("code".into(), json!(if sent { 0 } else { -1 }));
         }
-        town.talk(Word { kind: "work".into(), tense: Tense::Past, body, at: 0 });
+        town.talk(Word { kind: "work".into(), tense: Tense::Past, body, when: 0 });
         return;
     }
     let began = std::time::Instant::now();
@@ -64,5 +64,5 @@ async fn done(town: Rc<Town>, cmd: String, body: Value) {
         m.insert("out".into(), json!(stdout));
         m.insert("ms".into(), json!(ms));
     }
-    town.talk(Word { kind: "work".into(), tense: Tense::Past, body, at: 0 });
+    town.talk(Word { kind: "work".into(), tense: Tense::Past, body, when: 0 });
 }

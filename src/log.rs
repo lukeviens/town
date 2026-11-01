@@ -41,13 +41,13 @@ pub fn tail(path: &Path, bytes: u64) -> impl Iterator<Item = String> {
 }
 
 /// Rewrite the log down to `present` + a bounded recent tail, so it can't grow without end. Called
-/// on boot. The present (favourites, theme, …) is written FIRST so it survives even if its defining
+/// on boot. The present is written FIRST so it survives even if its defining
 /// line was old; the tail keeps recent history for `Town::past`.
 pub fn compact(path: &Path, present: &[Word], max_bytes: u64) {
     let head: String = present.iter().map(|w| w.to_line() + "\n").collect();
     let recent: String = tail(path, max_bytes).map(|l| l + "\n").collect();
     // ATOMIC: write a sibling .tmp, fsync it, then rename over the log. This file is the ONLY
-    // persistent copy of the present facts (favourites, theme, slots); a plain truncate+write
+    // persistent copy of the present facts; a plain truncate+write
     // would lose everything if we died between the two. rename() on the same dir is atomic.
     let mut tmp = path.to_path_buf().into_os_string();
     tmp.push(".tmp");

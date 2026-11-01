@@ -17,8 +17,10 @@ use crate::paths;
 use crate::town::Town;
 use crate::word::{Tense, Word};
 
-/// Give the residents their windows onto the town: `present`, `past`, and `reopen`.
+/// Give the residents their windows onto the town: `present`, `past`, `reopen`, and `TOWN_HOME`.
 pub fn install(lua: &Lua, town: &Rc<Town>) -> mlua::Result<()> {
+    lua.globals().set("TOWN_HOME", paths::town_home().to_string_lossy().to_string())?;
+
     let now = town.clone();
     lua.globals().set(
         "present",
@@ -73,7 +75,10 @@ pub fn open(lua: &Lua, town: &Rc<Town>) -> mlua::Result<()> {
     town.joins.borrow_mut().clear();
     *town.inside.borrow_mut() = Town::machinery();
 
-    // the composition vocabulary first, so residents can be written with it
+    // how a resident is written, then this town's own vocabulary, so residents can be written with both
+    if let Err(e) = lua.load(crate::RESIDENT).set_name("resident").exec() {
+        eprintln!("town: resident: {e}");
+    }
     if let Ok(src) = std::fs::read_to_string(paths::lib()) {
         if let Err(e) = lua.load(src).set_name("lib").exec() {
             eprintln!("town: lib: {e}");
@@ -131,17 +136,17 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
                 if watcher.watch(std::path::Path::new(&path), deep).is_err() {
                     return;
                 }
-                // a file greets with its current content (so theme is set on boot); a directory doesn't
+                // a file greets with its current content, so its resident is set on boot; a directory doesn't
                 if !dir {
                     if let Ok(text) = std::fs::read_to_string(&path) {
-                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text), at: 0 });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text), when: 0 });
                     }
                 }
                 while rx.recv().await.is_some() {
                     if dir {
-                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Past, body: Value::Null, at: 0 });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Past, body: Value::Null, when: 0 });
                     } else if let Ok(text) = std::fs::read_to_string(&path) {
-                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text), at: 0 });
+                        town_watch.talk(Word { kind: kind.clone(), tense: Tense::Present, body: Value::String(text), when: 0 });
                     }
                 }
             });
@@ -149,10 +154,10 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
         }
     }
 
-    // listen: each kind wakes the `talk` function; whatever it returns is talked
-    let handler: Option<Function> = spec.get("talk")?;
-    if let (Some(handler), Some(listen)) = (handler, spec.get::<Option<Table>>("listen")?) {
-        for kind in listen.sequence_values::<String>().filter_map(Result::ok) {
+    // kinds: each wakes the `listen` function; whatever it returns is talked
+    let handler: Option<Function> = spec.get("listen")?;
+    if let (Some(handler), Some(kinds)) = (handler, spec.get::<Option<Table>>("kinds")?) {
+        for kind in kinds.sequence_values::<String>().filter_map(Result::ok) {
             let handler = handler.clone();
             let town = town.clone();
             let lua = lua.clone();
@@ -162,7 +167,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
                 // said before it woke isn't lost
                 let greeting = town.present.borrow().get(&kind).cloned();
                 if let Some(body) = greeting {
-                    say(&lua, &handler, &town, &Word { kind: kind.clone(), tense: Tense::Present, body, at: 0 });
+                    listen(&lua, &handler, &town, &Word { kind: kind.clone(), tense: Tense::Present, body, when: 0 });
                 }
                 loop {
                     if age < town.age.get() {
@@ -172,7 +177,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
                         // re-check age AFTER waking: a reopen may have retired us WHILE we were
                         // parked in recv, and we must not dispatch one last word (double pickers).
                         // "*" listens to every kind
-                        Ok(w) if age >= town.age.get() && (kind == "*" || w.kind == kind) => say(&lua, &handler, &town, &w),
+                        Ok(w) if age >= town.age.get() && (kind == "*" || w.kind == kind) => listen(&lua, &handler, &town, &w),
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
@@ -190,7 +195,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
     }
 
     // join: a program town keeps talking to, the way `watch` is a file it keeps reading. Every
-    // line the program says is a past word of the declared kind; `work { at = <kind> }` writes a
+    // line the program says is a past word of the declared kind; `work { to = <kind> }` writes a
     // line back. What the lines MEAN is the resident's — the engine knows no protocol.
     if let Some(join) = spec.get::<Option<Table>>("join")? {
         for pair in join.pairs::<String, Table>() {
@@ -222,7 +227,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
                                 kind: kind.clone(),
                                 tense: Tense::Past,
                                 body: Value::Null,
-                                at: 0,
+                                when: 0,
                             });
                             let mut lines = BufReader::new(out).lines();
                             loop {
@@ -232,7 +237,7 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
                                             kind: kind.clone(),
                                             tense: Tense::Past,
                                             body: Value::String(l),
-                                            at: 0,
+                                            when: 0,
                                         }),
                                         _ => break, // it hung up
                                     },
@@ -255,12 +260,12 @@ fn wire(lua: &Lua, town: &Rc<Town>, path: &std::path::Path, age: u64) -> mlua::R
     Ok(())
 }
 
-// Wake a resident with a word (a lua table {kind, tense, body}); talk whatever it says
+// A resident listens to a word (a lua table {kind, tense, body}); talk whatever it says
 // back. serde carries both directions: `Word` defaults tense to present and ignores the
 // extra keys a resident attaches (label/act/aware). A `nil` return means "nothing to say"
 // (the common case) and is silent; a Lua error, or a NON-nil return that isn't a word (a
 // missing kind or a typo'd tense), is a bug — logged loudly rather than silently dropped.
-fn say(lua: &Lua, handler: &Function, town: &Town, w: &Word) {
+fn listen(lua: &Lua, handler: &Function, town: &Town, w: &Word) {
     // a null body is real nil in Lua, not mlua's truthy null sentinel: a resident testing
     // `if w.body == nil` must see what it plainly means.
     let opts = mlua::SerializeOptions::new()
@@ -289,7 +294,7 @@ mod inside {
     use crate::word::Tense;
 
     fn word(kind: &str) -> Word {
-        Word { kind: kind.into(), tense: Tense::Future, body: Value::Null, at: 0 }
+        Word { kind: kind.into(), tense: Tense::Future, body: Value::Null, when: 0 }
     }
 
     // what a resident watches or calls its own is said only by town: the square refuses it, and
@@ -304,11 +309,11 @@ mod inside {
             std::fs::write(&file, "bg=#000\n").unwrap();
             let resident = dir.join("r.lua");
             std::fs::write(&resident, format!(
-                "return {{ listen = {{}}, talk = function() end, watch = {{ colors = {:?} }}, own = {{ \"handle\" }} }}",
+                "return {{ kinds = {{}}, listen = function() end, watch = {{ colors = {:?} }}, own = {{ \"handle\" }} }}",
                 file.to_string_lossy()
             )).unwrap();
 
-            let town = Town::at(dir.join("past.log"));
+            let town = Town::with_log(dir.join("past.log"));
             assert!(!town.admits(&word("work")), "town's own commands, from the start");
             wire(&Lua::new(), &town, &resident, 0).unwrap();
             assert!(!town.admits(&word("colors")), "a watch speaks for its file");

@@ -8,3 +8,7 @@ pub mod residents;
 pub mod square;
 pub mod paths;
 pub mod work;
+
+/// How a resident is written: the tenses, `on`/`react`, `work`, the file helpers. Every town's
+/// residents are loaded after it, and after the town's own lib.lua.
+pub const RESIDENT: &str = include_str!("resident.lua");

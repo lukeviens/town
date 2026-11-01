@@ -1,4 +1,4 @@
-//! Paths: the square and the past live in ~/.cache/town; the residents in the dotfiles.
+//! Paths: the square and the past live in ~/.cache/town; a town's lib.lua and residents in its home.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -32,16 +32,22 @@ pub fn past() -> PathBuf {
     cache().join("past.log")
 }
 
+/// a town's home: its lib.lua and its residents. $TOWN_HOME, else ~/.config/town.
+pub fn town_home() -> PathBuf {
+    std::env::var_os("TOWN_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config/town"))
+}
+
 pub fn residents() -> PathBuf {
-    home().join(".config/town/residents")
+    town_home().join("residents")
 }
 
 pub fn lib() -> PathBuf {
-    home().join(".config/town/lib.lua")
+    town_home().join("lib.lua")
 }
 
+/// the source this VM was built from, wherever that was, so a rebuild it is missing can be seen
 pub fn src() -> PathBuf {
-    home().join(".config/town/src")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
 /// The newest mtime anywhere under `dir`.

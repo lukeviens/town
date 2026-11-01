@@ -12,12 +12,13 @@ pub struct Word {
     #[serde(default)]
     pub body: Value,
     /// When it was said, ms since the epoch; the town stamps it as it talks. 0 = not yet said.
-    #[serde(default, skip_serializing_if = "unsaid")]
-    pub at: u64,
+    /// Logs written before the word was `when` call it `at`.
+    #[serde(default, alias = "at", skip_serializing_if = "unsaid")]
+    pub when: u64,
 }
 
-fn unsaid(at: &u64) -> bool {
-    *at == 0
+fn unsaid(when: &u64) -> bool {
+    *when == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

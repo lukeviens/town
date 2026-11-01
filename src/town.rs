@@ -17,7 +17,7 @@ pub struct Town {
     pub age: Cell<u64>,                            // bumped on reopen; old listeners retire
     pub log: std::path::PathBuf,                   // the fact log this town folds + appends
     pub watchers: RefCell<Vec<tokio::task::JoinHandle<()>>>, // watch + join tasks; aborted on reopen
-    /// kind → the stdin of a program town has joined; `work { at = kind }` writes a line to it.
+    /// kind → the stdin of a program town has joined; `work { to = kind }` writes a line to it.
     pub joins: RefCell<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
     /// kinds only town itself makes — `work`, what its watches and joins say, and what a resident
     /// declares its own. The square refuses them from outside: whoever connects may say what they
@@ -27,12 +27,12 @@ pub struct Town {
 
 impl Town {
     pub fn new() -> Rc<Town> {
-        Self::at(paths::past())
+        Self::with_log(paths::past())
     }
 
     /// Like `new`, but folding + appending an explicit log path — the seam that lets tests run
     /// against an isolated tempfile instead of the real ~/.cache/town/past.log.
-    pub fn at(log: std::path::PathBuf) -> Rc<Town> {
+    pub fn with_log(log: std::path::PathBuf) -> Rc<Town> {
         // the present is the fold of the past — rebuild it from the log on boot
         let past = std::fs::read_to_string(&log).unwrap_or_default();
         let present = fold(past.lines().filter_map(Word::from_line));
@@ -61,8 +61,8 @@ impl Town {
     // Talk a word: only facts fold into the present and land in the log (events and
     // intentions are transient — nothing ever reads them back); every word is sent on.
     pub fn talk(&self, mut word: Word) {
-        if word.at == 0 {
-            word.at = std::time::SystemTime::now()
+        if word.when == 0 {
+            word.when = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
@@ -91,13 +91,13 @@ impl Town {
                 kind: k.clone(),
                 tense: Tense::Present,
                 body: body.clone(),
-                at: 0,
+                when: 0,
             })
             .collect()
     }
 
     /// The past of a kind: its present-tense bodies, in the order they happened. Reads only
-    /// the TAIL of the log (recent history is all a caller wants — the picker's recent list)
+    /// the TAIL of the log (recent history is all a caller wants)
     /// so the cost is bounded no matter how big the log grows.
     pub fn past(&self, kind: &str) -> Vec<Value> {
         log::tail(&self.log, 128 * 1024)
@@ -173,24 +173,24 @@ mod tests {
     #[test]
     fn compaction_preserves_present_and_leaves_no_tmp() {
         let path = tmp_log();
-        let town = Town::at(path.clone());
+        let town = Town::with_log(path.clone());
         town.talk(Word {
             kind: "favourites".into(),
             tense: Tense::Present,
             body: serde_json::json!({ "1": { "app": "X" } }),
-            at: 0,
+            when: 0,
         });
         for i in 0..50u32 {
             town.talk(Word {
                 kind: "theme".into(),
                 tense: Tense::Present,
                 body: serde_json::json!({ "bg": format!("#{i:06x}") }),
-                at: 0,
+                when: 0,
             });
         }
         let before = town.present.borrow().clone();
         town.compact(512); // tiny → favourites falls out of the recent tail
-        let re = Town::at(path.clone()); // reload from the compacted log
+        let re = Town::with_log(path.clone()); // reload from the compacted log
         assert_eq!(*re.present.borrow(), before, "present not preserved across compaction");
         assert_eq!(re.present.borrow()["favourites"]["1"]["app"], "X");
         let mut tmp = path.clone().into_os_string();
@@ -203,10 +203,10 @@ mod tests {
     #[test]
     fn talk_folds_facts_only() {
         let path = tmp_log();
-        let town = Town::at(path.clone());
-        town.talk(Word { kind: "theme".into(), tense: Tense::Present, body: serde_json::json!({"bg":"#111"}), at: 0 });
-        town.talk(Word { kind: "key".into(), tense: Tense::Past, body: serde_json::json!({"press":"f"}), at: 0 });
-        town.talk(Word { kind: "pick".into(), tense: Tense::Future, body: serde_json::json!({"what":"apps"}), at: 0 });
+        let town = Town::with_log(path.clone());
+        town.talk(Word { kind: "theme".into(), tense: Tense::Present, body: serde_json::json!({"bg":"#111"}), when: 0 });
+        town.talk(Word { kind: "key".into(), tense: Tense::Past, body: serde_json::json!({"press":"f"}), when: 0 });
+        town.talk(Word { kind: "pick".into(), tense: Tense::Future, body: serde_json::json!({"what":"apps"}), when: 0 });
         assert_eq!(town.present.borrow()["theme"]["bg"], "#111");
         assert!(!town.present.borrow().contains_key("key"));
         assert!(!town.present.borrow().contains_key("pick"));
