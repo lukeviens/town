@@ -6,6 +6,7 @@ use std::rc::Rc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::{error::RecvError, Receiver};
 
 use crate::paths;
 use crate::town::Town;
@@ -23,7 +24,7 @@ pub async fn run(listener: UnixListener, town: Rc<Town>) {
 //   listen  — hear the news only (one-way, out)
 //   join    — hear the news AND talk words in, on the one connection (two-way)
 //   else    — a speaker: every line is a word (one-way, in)
-// `join` is what a long-lived runtime (HS) wants: one socket, no process per word.
+// `join` is what a long-lived program wants: one socket, no process per word.
 async fn at_square(conn: UnixStream, town: Rc<Town>) {
     let (r, w) = conn.into_split();
     let mut lines = BufReader::new(r).lines();
@@ -32,47 +33,46 @@ async fn at_square(conn: UnixStream, town: Rc<Town>) {
         _ => return,
     };
     match first.trim() {
-        "listen" => news(w, &town).await,
+        "listen" => news(w, &town, town.words.subscribe()).await,
         "join" => {
+            // listening before hearing: what their first word makes town say, they hear
+            let words = town.words.subscribe();
             let talker = town.clone();
             let heard = async move {
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(word) = Word::from_line(&line) {
-                        said(&talker, word);
-                    }
+                    said(&talker, &line);
                 }
             };
             // hear words in and stream news out at once; when they hang up, both end.
             tokio::select! {
                 _ = heard => {}
-                _ = news(w, &town) => {}
+                _ = news(w, &town, words) => {}
             }
         }
         _ => {
-            if let Some(word) = Word::from_line(&first) {
-                said(&town, word);
-            }
+            said(&town, &first);
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(word) = Word::from_line(&line) {
-                    said(&town, word);
-                }
+                said(&town, &line);
             }
         }
     }
 }
 
-// a word from someone at the square: said in town, unless it is one only town itself makes
-fn said(town: &Town, word: Word) {
-    if town.admits(&word) {
-        town.talk(word);
-    } else {
-        eprintln!("town: refused a `{}` word from the square — only town makes those", word.kind);
+// a line from someone at the square: said in town if it is a word, and not one only town itself
+// makes
+fn said(town: &Town, line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    match serde_json::from_str::<Word>(line) {
+        Ok(word) if town.admits(&word) => town.talk(word),
+        Ok(word) => town.error("square", Some(&word.kind), "refused: only town makes those".into()),
+        Err(e) => town.error("square", None, format!("not a word: {e}")),
     }
 }
 
 // Stream the present, then every word thereafter, to a listener. Ends when they hang up.
-async fn news(mut w: OwnedWriteHalf, town: &Town) {
-    let mut words = town.words.subscribe();
+async fn news(mut w: OwnedWriteHalf, town: &Town, mut words: Receiver<Word>) {
     for word in town.present_words() {
         if w.write_all(format!("{}\n", word.to_line()).as_bytes()).await.is_err() {
             return;
@@ -85,7 +85,7 @@ async fn news(mut w: OwnedWriteHalf, town: &Town) {
                     return;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(RecvError::Lagged(_)) => continue,
             Err(_) => return,
         }
     }
@@ -98,10 +98,12 @@ async fn news(mut w: OwnedWriteHalf, town: &Town) {
 pub fn ask(word: &str, wait: std::time::Duration) -> bool {
     use std::io::{BufRead, BufReader as SyncReader, ErrorKind, Write};
     use std::os::unix::net::UnixStream as SyncStream;
-    let Ok(mut word) = serde_json::from_str::<serde_json::Value>(word) else {
-        eprintln!("town: ask: not a word");
+    // a non-word would be said as an `error` no one waits for: refuse it here, and say why
+    if let Err(e) = serde_json::from_str::<Word>(word) {
+        eprintln!("town: ask: not a word: {e}");
         return false;
-    };
+    }
+    let Ok(mut word) = serde_json::from_str::<serde_json::Value>(word) else { return false };
     let Ok(mut s) = SyncStream::connect(paths::square()) else {
         eprintln!("town: no one at the square (is town up?)");
         return false;
@@ -112,7 +114,9 @@ pub fn ask(word: &str, wait: std::time::Duration) -> bool {
     let id = match word["body"]["id"].as_str() {
         Some(id) => id.to_string(),
         None => {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
             format!("{}-{}", std::process::id(), now.as_millis())
         }
     };
@@ -133,8 +137,18 @@ pub fn ask(word: &str, wait: std::time::Duration) -> bool {
                     println!("{}", w["body"]);
                     return true;
                 }
+                // refused at the square: no answer is coming
+                if w["kind"] == "error"
+                    && w["body"]["from"] == "square"
+                    && w["body"]["heard"] == kind
+                {
+                    eprintln!("town: ask: {}", w["body"]["message"].as_str().unwrap_or("refused"));
+                    return false;
+                }
             }
-            Some(Err(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Some(Err(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                continue
+            }
             _ => return false, // the square closed
         }
     }
@@ -182,5 +196,30 @@ pub fn reach(verb: &str, word: Option<&String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // what the square hears and will not say is said as an `error`: a line that is not a word, and
+    // a word only town makes
+    #[test]
+    fn the_square_says_what_it_will_not_say() {
+        let dir = std::env::temp_dir().join(format!("town-square-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let town = Town::with_log(dir.join("past.log"));
+        let mut words = town.words.subscribe();
+        said(&town, r#"{"body":{"x":1}}"#);
+        let w = words.try_recv().expect("a non-word is an error word");
+        assert_eq!((w.kind.as_str(), w.body["from"].as_str()), ("error", Some("square")));
+        assert!(w.body["message"].as_str().unwrap().starts_with("not a word"));
+        said(&town, r#"{"kind":"work","tense":"future","body":{"cmd":"true"}}"#);
+        let w = words.try_recv().expect("a refusal is an error word");
+        assert_eq!(w.body["heard"], "work");
+        said(&town, "");
+        assert!(words.try_recv().is_err(), "a blank line is nothing");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

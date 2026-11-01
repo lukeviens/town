@@ -34,7 +34,8 @@ pub fn tail(path: &Path, bytes: u64) -> impl Iterator<Item = String> {
     let mut buf = String::from_utf8_lossy(&raw).into_owned();
     if from > 0 {
         if let Some(nl) = buf.find('\n') {
-            buf.drain(..=nl); // the first line is partial (its head byte may be a split char) — drop it
+            // the first line is partial (its head byte may be a split char) — drop it
+            buf.drain(..=nl);
         }
     }
     buf.lines().map(str::to_string).collect::<Vec<_>>().into_iter()

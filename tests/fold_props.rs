@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use serde_json::Value;
-use town::town::fold;
+use town::town::{fold, Town};
 use town::word::{Tense, Word};
 
 fn arb_tense() -> impl Strategy<Value = Tense> {
@@ -32,20 +32,21 @@ fn arb_body() -> impl Strategy<Value = Value> {
 
 // Kinds: empty, plain, and arbitrary unicode (JSON-escaping stress).
 fn arb_word() -> impl Strategy<Value = Word> {
-    (
-        prop_oneof![Just(String::new()), "[a-z]{1,6}", ".*"],
-        arb_tense(),
-        arb_body(),
-    )
-        .prop_map(|(kind, tense, body)| Word { kind, tense, body, when: 0 })
+    (prop_oneof![Just(String::new()), "[a-z]{1,6}", ".*"], arb_tense(), arb_body())
+        .prop_map(|(kind, tense, body)| Word::new(kind, tense, body))
 }
 
-// An independent reference for the fold: last present, non-empty-kind word wins.
+// An independent reference for the fold: last present, non-empty-kind word wins, and one with no
+// body takes its kind away.
 fn reference_fold(ws: &[Word]) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
     for w in ws {
         if w.tense == Tense::Present && !w.kind.is_empty() {
-            m.insert(w.kind.clone(), w.body.clone());
+            if w.body.is_null() {
+                m.remove(&w.kind);
+            } else {
+                m.insert(w.kind.clone(), w.body.clone());
+            }
         }
     }
     m
@@ -71,23 +72,29 @@ proptest! {
         prop_assert_eq!(&back.body, &w.body);
     }
 
-    // fold == the reference: last-wins per kind, over facts only (present + non-empty kind).
+    // fold == the reference: last-wins per kind, over facts only (present + non-empty kind), and
+    // a fact of nothing forgets.
     #[test]
     fn fold_matches_reference(ws in prop::collection::vec(arb_word(), 0..64)) {
         prop_assert_eq!(fold(ws.clone().into_iter()), reference_fold(&ws));
     }
 
-    // the invariant residents rely on: present == fold(all facts so far), at EVERY prefix.
+    // the invariant residents rely on: the present a town keeps as it talks == the fold of every
+    // word so far, at EVERY prefix; and a town rebuilt from its log keeps the same.
     #[test]
     fn present_equals_fold_at_every_prefix(ws in prop::collection::vec(arb_word(), 0..48)) {
-        let mut present: BTreeMap<String, Value> = BTreeMap::new();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let log = std::env::temp_dir().join(format!("town-prop-{}-{n}.log", std::process::id()));
+        let town = Town::with_log(log.clone());
         for i in 0..ws.len() {
-            let w = &ws[i];
-            if w.tense == Tense::Present && !w.kind.is_empty() {   // mirror Town::talk's insert
-                present.insert(w.kind.clone(), w.body.clone());
-            }
-            prop_assert_eq!(&present, &fold(ws[..=i].iter().cloned()));
+            town.talk(ws[i].clone());
+            prop_assert_eq!(&*town.present.borrow(), &fold(ws[..=i].iter().cloned()));
         }
+        let rebuilt = Town::with_log(log.clone());
+        prop_assert_eq!(&*rebuilt.present.borrow(), &*town.present.borrow());
+        std::fs::remove_file(&log).ok();
     }
 
     // distinct kinds ⇒ the fold is order-independent (no cross-kind interference).

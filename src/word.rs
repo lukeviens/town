@@ -12,7 +12,7 @@ pub struct Word {
     #[serde(default)]
     pub body: Value,
     /// When it was said, ms since the epoch; the town stamps it as it talks. 0 = not yet said.
-    /// Logs written before the word was `when` call it `at`.
+    /// `at` is read as `when`.
     #[serde(default, alias = "at", skip_serializing_if = "unsaid")]
     pub when: u64,
 }
@@ -34,6 +34,11 @@ fn present() -> Tense {
 }
 
 impl Word {
+    /// A word not yet said: town stamps `when` as it talks it.
+    pub fn new(kind: impl Into<String>, tense: Tense, body: Value) -> Word {
+        Word { kind: kind.into(), tense, body, when: 0 }
+    }
+
     pub fn from_line(line: &str) -> Option<Word> {
         serde_json::from_str(line).ok()
     }
@@ -55,17 +60,17 @@ mod tests {
 
     #[test]
     fn tense_defaults_to_present() {
-        let w = Word::from_line(r#"{"kind":"place","body":{}}"#).unwrap();
+        let w = Word::from_line(r#"{"kind":"note","body":{}}"#).unwrap();
         assert_eq!(w.tense, Tense::Present);
     }
 
     #[test]
     fn a_word_survives_a_roundtrip() {
-        let w = Word::from_line(r#"{"kind":"pick","tense":"future","body":{"what":"apps"}}"#).unwrap();
+        let w = Word::from_line(r#"{"kind":"time","tense":"future","body":{"who":"me"}}"#).unwrap();
         assert_eq!(w.tense, Tense::Future);
         let again = Word::from_line(&w.to_line()).unwrap();
-        assert_eq!(again.kind, "pick");
+        assert_eq!(again.kind, "time");
         assert_eq!(again.tense, Tense::Future);
-        assert_eq!(again.body["what"], "apps");
+        assert_eq!(again.body["who"], "me");
     }
 }

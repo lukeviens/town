@@ -1,11 +1,13 @@
-//! town — a small VM that composes your desktop out of words. Residents (residents/*.lua)
-//! listen for words and talk words back; the present is their fold, the past keeps them
-//! all. Other runtimes reach the same town through the square.
+//! town — a VM whose one instruction is the word, { kind, tense, body, when }, said on the square.
+//! Its programs are residents, Lua files at the paths it is opened with: they listen there and
+//! talk back, and any other program may talk and listen there too. A fact, a present-tense word,
+//! folds into the present (the last of each kind) and is kept in the log; past and future words
+//! pass through.
 //!
-//!   town              open the town (run its programs)
-//!   town talk <json>  say a word
+//!   town <path>…      open a town: Lua files, or folders of them, in order
+//!   town talk <word>  say a word
 //!   town listen       hear the words
-//!   town ask <json>   say a word and wait for its answer
+//!   town ask <word>   say a word, and wait for its answer
 
 // the engine lives in the library crate (src/lib.rs); the binary just orchestrates it.
 use town::town::Town;
@@ -16,24 +18,39 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("talk") => return square::reach("talk", Some(&word_line(&args[2..]))),
         Some("listen") => return square::reach("listen", None),
-        // ask: say a word, wait for its answer, print it. TOWN_WAIT seconds (default 1800), else exit 1.
+        // ask: say a word, wait for its answer, print it. TOWN_WAIT seconds (default 1800), else
+        // exit 1.
         Some("ask") => {
             let wait = std::env::var("TOWN_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
-            let answered = square::ask(&word_line(&args[2..]), std::time::Duration::from_secs(wait));
+            let answered =
+                square::ask(&word_line(&args[2..]), std::time::Duration::from_secs(wait));
             std::process::exit(if answered { 0 } else { 1 });
         }
-        None => {} // no verb → open the town below
-        Some(other) => {
-            // never boot on a stray arg — that would remove the square and spawn a rogue server
-            eprintln!("town: unknown command '{other}' (expected: talk, listen, ask, or nothing to open)");
-            return;
+        None => {
+            // a town is its programs: with none named, there is nothing to open
+            eprintln!(
+                "usage: town <path>…        open a town: Lua files, or folders of them, in order
+       town talk <word>     say a word
+       town listen          hear the words
+       town ask <word>      say a word, and wait for its answer"
+            );
+            std::process::exit(2);
         }
+        Some(_) => {}
     }
+    // never boot on a path that is not there — a misspelled verb included — rather than open half
+    // a town
+    let programs: Vec<std::path::PathBuf> =
+        args[1..].iter().map(std::path::PathBuf::from).collect();
+    if let Some(missing) = programs.iter().find(|p| !p.exists()) {
+        eprintln!("town: no such program: {}", missing.display());
+        std::process::exit(2);
+    }
+    // whole, but not resolved: a link is followed each time the town opens, so a moved one is seen
+    let programs: Vec<std::path::PathBuf> =
+        programs.iter().map(|p| std::path::absolute(p).unwrap_or(p.clone())).collect();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let path = paths::square();
@@ -45,42 +62,23 @@ fn main() {
         std::fs::remove_file(&path).ok(); // no one home; clear any stale socket
         let listener = match tokio::net::UnixListener::bind(&path) {
             Ok(l) => l,
-            Err(_) => {
-                eprintln!("town: the square is taken — town is already up");
-                return;
+            Err(e) => {
+                // no one answered, so it is not taken: say why it would not open
+                // a failure, so launchd tries again; only `already up` is a clean exit
+                eprintln!("town: cannot open the square at {}: {e}", path.display());
+                std::process::exit(1);
             }
         };
         let town = Town::new();
         town.compact(128 * 1024); // keep the past log bounded; only recent facts feed past()
-        // say whether the core running is the core on disk, so a forgotten rebuild is visible
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(stale) = paths::stale(&exe, &paths::src()) {
-                town.talk(town::word::Word {
-                    kind: "build".into(),
-                    tense: town::word::Tense::Present,
-                    body: serde_json::json!({ "stale": stale }),
-                    when: 0,
-                });
-            }
-        }
-        // say which program this is, by the same `shasum` a build uses, so the build can tell the
-        // town running is the one it made — not an older one still in memory, nor one launchd refused
-        if let Ok(exe) = std::env::current_exe() {
-            if let Ok(out) = std::process::Command::new("/usr/bin/shasum").args(["-a", "256"]).arg(&exe).output() {
-                let hash = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
-                std::fs::write(paths::running(), format!("{hash} {}\n", std::process::id())).ok();
-            }
-        }
         town::work::obey(&town); // future `work` is run outside, off the runtime
         let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
         if let Err(e) = residents::install(&lua, &town) {
             eprintln!("town: {e}");
-            return;
+            std::process::exit(1);
         }
-        if let Err(e) = residents::open(&lua, &town) {
-            eprintln!("town: {e}");
-            return;
-        }
+        residents::open(&lua, &town, &programs);
+        residents::keep(&lua, &town, programs);
         square::run(listener, town).await; // residents run alongside on the same runtime
     });
 }
@@ -89,10 +87,8 @@ fn main() {
 // TENSE is an optional leading `past`/`present`/`future`; without it, a present fact.
 fn word_line(args: &[String]) -> String {
     use town::word::{Tense, Word};
-    if let Some(a) = args.first() {
-        if a.starts_with('{') {
-            return a.clone();
-        }
+    if let Some(json) = args.first().filter(|a| a.starts_with('{')) {
+        return json.clone();
     }
     let (tense, rest) = match args.first().map(String::as_str) {
         Some("past") => (Tense::Past, &args[1..]),
@@ -100,27 +96,18 @@ fn word_line(args: &[String]) -> String {
         Some("present") => (Tense::Present, &args[1..]),
         _ => (Tense::Present, args),
     };
-    match rest.first() {
-        Some(kind) => {
-            let mut body = serde_json::Map::new();
-            for kv in &rest[1..] {
-                if let Some((k, v)) = kv.split_once('=') {
-                    // Tense is the word's, never the body's. Written here it is silently ignored:
-                    // the word goes out as a present fact, folds into the present forever, and
-                    // carries the tense it meant as data. (`kind` can be a real body field, so only
-                    // this one is a mistake.)
-                    if k == "tense" {
-                        eprintln!(
-                            "town: tense belongs to the word, not its body.\n\
-                             town talk [past|present|future] <kind> key=value …"
-                        );
-                        std::process::exit(2);
-                    }
-                    body.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-                }
-            }
-            Word { kind: kind.clone(), tense, body: serde_json::Value::Object(body), when: 0 }.to_line()
+    let Some((kind, pairs)) = rest.split_first() else { return String::new() };
+    let mut body = serde_json::Map::new();
+    for (k, v) in pairs.iter().filter_map(|kv| kv.split_once('=')) {
+        // Tense is the word's, never the body's. Written here it is silently ignored: the word
+        // goes out as a present fact, folds into the present forever, and carries the tense it
+        // meant as data. (`kind` can be a real body field; `tense` never is.)
+        if k == "tense" {
+            eprintln!("town: tense belongs to the word, not its body.");
+            eprintln!("town talk [past|present|future] <kind> key=value …");
+            std::process::exit(2);
         }
-        None => String::new(),
+        body.insert(k.into(), v.into());
     }
+    Word::new(kind, tense, body.into()).to_line()
 }
