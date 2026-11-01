@@ -2,6 +2,9 @@
 name = "town"
 version = "0.1.0"
 edition = "2021"
+description = "a little VM with one instruction: the word."
+license = "MIT"
+repository = "https://github.com/lukeviens/town"
 
 [[bin]]
 name = "town"
