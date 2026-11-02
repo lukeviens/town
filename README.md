@@ -64,6 +64,9 @@ for is still answered, though not once town itself starts again. And perhaps
   kind; `work(line, { join = kind })` writes one back.
 - `own = { kind, … }`: kinds only this resident says.
 
+[`examples/`](examples) has four small residents that use all of it, and talk to each other: from
+a checkout of this repo, `town examples`.
+
 When something fails, town says a past `error`, `{ from, heard, message }`: `town listen` hears
 it. Only town says `work`, `after` and `error`, and what a resident watches, joins or owns; the
 square refuses them from anyone else.
