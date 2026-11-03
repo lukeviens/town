@@ -1,7 +1,12 @@
-//! town as a library — the same modules the binary runs, exposed so tests (and any other
-//! crate) can reach the pure core (`word`, `town::fold`) and the engine directly.
+//! town as a library — the same modules the binary runs, so tests, and any other crate, can reach
+//! the word, the present's fold, and the rest of town directly.
 
+pub mod body;
+pub mod connection;
+pub mod language;
 pub mod log;
+pub mod lua;
+pub mod parts;
 pub mod paths;
 pub mod residents;
 pub mod square;

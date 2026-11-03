@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use serde_json::Value;
+use town::body::Body;
 use town::town::{fold, Town};
 use town::word::{Tense, Word};
 
@@ -33,16 +34,16 @@ fn arb_body() -> impl Strategy<Value = Value> {
 // Kinds: empty, plain, and arbitrary unicode (JSON-escaping stress).
 fn arb_word() -> impl Strategy<Value = Word> {
     (prop_oneof![Just(String::new()), "[a-z]{1,6}", ".*"], arb_tense(), arb_body())
-        .prop_map(|(kind, tense, body)| Word::new(kind, tense, body))
+        .prop_map(|(kind, tense, body)| Word::new(kind, tense, Body::of(body)))
 }
 
 // An independent reference for the fold: last present, non-empty-kind word wins, and one with no
 // body takes its kind away.
-fn reference_fold(ws: &[Word]) -> BTreeMap<String, Value> {
+fn reference_fold(ws: &[Word]) -> BTreeMap<String, Body> {
     let mut m = BTreeMap::new();
     for w in ws {
         if w.tense == Tense::Present && !w.kind.is_empty() {
-            if w.body.is_null() {
+            if w.body.is_none() {
                 m.remove(&w.kind);
             } else {
                 m.insert(w.kind.clone(), w.body.clone());
@@ -56,17 +57,17 @@ proptest! {
     // no input — valid or garbage — can panic the parser or the serializer.
     #[test]
     fn from_line_never_panics(s in ".*") {
-        let _ = Word::from_line(&s);
+        let _ = town::connection::read(&s);
     }
     #[test]
     fn to_line_never_panics(w in arb_word()) {
-        let _ = w.to_line();
+        let _ = town::connection::line(&w);
     }
 
     // from_line ∘ to_line is the identity on (kind, tense, body).
     #[test]
     fn roundtrip_is_identity(w in arb_word()) {
-        let back = Word::from_line(&w.to_line()).expect("a serialized word must parse back");
+        let back = town::connection::read(&town::connection::line(&w)).expect("a word said is read back");
         prop_assert_eq!(&back.kind, &w.kind);
         prop_assert_eq!(back.tense, w.tense);
         prop_assert_eq!(&back.body, &w.body);

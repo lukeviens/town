@@ -15,13 +15,18 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # the languages a town may speak, for a town to name among its programs
+          postInstall = ''
+            mkdir -p $out/share/town
+            cp -r languages $out/share/town/
+          '';
         };
       });
 
       # town on a mac: the town cli on PATH, and launchd keeping your town open from login.
       darwinModules.default = { config, lib, pkgs, ... }:
         let
-          town = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          town = config.town.package;
           home = "/Users/${config.system.primaryUser}";
         in
         {
@@ -29,6 +34,13 @@
             type = lib.types.listOf lib.types.str;
             default = [ "${home}/.config/town" ];
             description = "your town: programs, or folders of them, in order. yours to write.";
+          };
+
+          options.town.package = lib.mkOption {
+            type = lib.types.package;
+            default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+            # its languages are in share/town/languages, to name among the programs
+            description = "the town that runs";
           };
 
           config = {

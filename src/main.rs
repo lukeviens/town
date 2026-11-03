@@ -9,21 +9,20 @@
 //!   town listen       hear the words
 //!   town ask <word>   say a word, and wait for its answer
 
-// the engine lives in the library crate (src/lib.rs); the binary just orchestrates it.
+// town itself is the library (src/lib.rs); this is how it is started, and reached from a shell
 use town::town::Town;
 use town::{paths, residents, square};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("talk") => return square::reach("talk", Some(&word_line(&args[2..]))),
-        Some("listen") => return square::reach("listen", None),
+        Some("talk") => return square::reach("talk", Some(said(&args[2..])), None),
+        Some("listen") => return square::reach("listen", None, args.get(2)),
         // ask: say a word, wait for its answer, print it. TOWN_WAIT seconds (default 1800), else
         // exit 1.
         Some("ask") => {
             let wait = std::env::var("TOWN_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
-            let answered =
-                square::ask(&word_line(&args[2..]), std::time::Duration::from_secs(wait));
+            let answered = square::ask(said(&args[2..]), std::time::Duration::from_secs(wait));
             std::process::exit(if answered { 0 } else { 1 });
         }
         None => {
@@ -31,7 +30,7 @@ fn main() {
             eprintln!(
                 "usage: town <path>…        open a town: programs, or folders of them, in order
        town talk <word>     say a word
-       town listen          hear the words
+       town listen [language] hear the words
        town ask <word>      say a word, and wait for its answer"
             );
             std::process::exit(2);
@@ -46,7 +45,8 @@ fn main() {
         eprintln!("town: no such program: {}", missing.display());
         std::process::exit(2);
     }
-    // whole, but not resolved: a link is followed each time the town opens, so a moved one is seen
+    // whole, but a link left as it is: it is followed each time the town opens, so a moved one is
+    // seen
     let programs: Vec<std::path::PathBuf> =
         programs.iter().map(|p| std::path::absolute(p).unwrap_or(p.clone())).collect();
 
@@ -70,10 +70,10 @@ fn main() {
             }
         };
         let town = Town::new();
-        town.compact(128 * 1024); // keep the past log bounded; only recent facts feed past()
+        town.compact(); // keep the past log bounded; only recent facts feed past()
         town::work::answer(&town); // future `work`, `after` and `join`, answered off the runtime
         let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
-        if let Err(e) = residents::install(&lua, &town) {
+        if let Err(e) = town::lua::install(&lua, &town) {
             eprintln!("town: {e}");
             std::process::exit(1);
         }
@@ -83,31 +83,39 @@ fn main() {
     });
 }
 
-// A word to talk, from the command line: raw JSON, or `[TENSE] KIND key=value …`.
+// A word to talk, from the command line: JSON as it is, or `[TENSE] KIND key=value …`, said in
+// `words`, town's own language for a word on a line, so town reads it as it reads any language.
 // TENSE is an optional leading `past`/`present`/`future`; without it, a present fact.
-fn word_line(args: &[String]) -> String {
-    use town::word::{Tense, Word};
+fn said(args: &[String]) -> square::Said {
     if let Some(json) = args.first().filter(|a| a.starts_with('{')) {
-        return json.clone();
+        return square::Said::Json(json.clone());
     }
-    let (tense, rest) = match args.first().map(String::as_str) {
-        Some("past") => (Tense::Past, &args[1..]),
-        Some("future") => (Tense::Future, &args[1..]),
-        Some("present") => (Tense::Present, &args[1..]),
-        _ => (Tense::Present, args),
-    };
-    let Some((kind, pairs)) = rest.split_first() else { return String::new() };
-    let mut body = serde_json::Map::new();
-    for (k, v) in pairs.iter().filter_map(|kv| kv.split_once('=')) {
-        // Tense is the word's, never the body's. Written here it is silently ignored: the word
-        // goes out as a present fact, folds into the present forever, and carries the tense it
-        // meant as data. (`kind` can be a real body field; `tense` never is.)
-        if k == "tense" {
-            eprintln!("town: tense belongs to the word, not its body.");
-            eprintln!("town talk [past|present|future] <kind> key=value …");
-            std::process::exit(2);
-        }
-        body.insert(k.into(), v.into());
+    // Tense is the word's, never the body's. Written here it is silently ignored: the word goes out
+    // as a present fact, folds into the present forever, and carries the tense it meant as data.
+    // (`kind` can be a real body field; `tense` never is.)
+    if args.iter().any(|a| a.starts_with("tense=")) {
+        eprintln!("town: tense belongs to the word, not its body.");
+        eprintln!("town talk [past|present|future] <kind> key=value …");
+        std::process::exit(2);
     }
-    Word::new(kind, tense, body.into()).to_line()
+    // what follows the kind is its body, key=value each: anything else is no word
+    let tensed = ["past", "present", "future"].contains(&args.first().map_or("", String::as_str));
+    if args.len() == tensed as usize {
+        eprintln!("town: a word has a kind");
+        eprintln!("town talk [past|present|future] <kind> key=value …");
+        std::process::exit(2);
+    }
+    if let Some(bad) =
+        args.iter().skip(1 + tensed as usize).find(|a| !a.contains('=') || a.starts_with('='))
+    {
+        eprintln!("town: `{bad}` is not key=value");
+        eprintln!("town talk [past|present|future] <kind> key=value …");
+        std::process::exit(2);
+    }
+    // a tab or a line's end would end a word in `words`, or a part of one: such a word goes as JSON
+    if args.iter().any(|a| a.contains(['\t', '\n'])) {
+        eprintln!("town: a tab or a line's end cannot be said short; say the word in JSON");
+        std::process::exit(2);
+    }
+    square::Said::Words(args.to_vec())
 }

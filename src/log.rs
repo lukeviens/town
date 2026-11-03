@@ -5,16 +5,23 @@ use std::path::Path;
 
 use crate::word::Word;
 
-/// Append a fact as one line. Best-effort — logs and swallows on failure.
-pub fn append(path: &Path, word: &Word) {
+/// Append a fact as one line, and how many bytes it took. Best-effort — logs and swallows on
+/// failure.
+pub fn append(path: &Path, word: &Word) -> u64 {
+    let line = crate::connection::line(word) + "\n";
     match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut past) => {
             use std::io::Write;
-            if writeln!(past, "{}", word.to_line()).is_err() {
+            if past.write_all(line.as_bytes()).is_err() {
                 eprintln!("town: past: append failed for '{}'", word.kind);
+                return 0;
             }
+            line.len() as u64
         }
-        Err(e) => eprintln!("town: past: cannot open {}: {e}", path.display()),
+        Err(e) => {
+            eprintln!("town: past: cannot open {}: {e}", path.display());
+            0
+        }
     }
 }
 
@@ -41,12 +48,23 @@ pub fn tail(path: &Path, bytes: u64) -> impl Iterator<Item = String> {
     buf.lines().map(str::to_string).collect::<Vec<_>>().into_iter()
 }
 
-/// Rewrite the log down to `present` + a bounded recent tail, so it can't grow without end. Called
-/// on boot. The present is written FIRST so it survives even if its defining
-/// line was old; the tail keeps recent history for `Town::past`.
+/// Rewrite the log down to a bounded recent tail, and before it the present facts the tail does not
+/// hold, so it can't grow without end, and every fact is in it once, in the order it was said: the
+/// present survives, and the tail keeps recent history for `Town::past`.
 pub fn compact(path: &Path, present: &[Word], max_bytes: u64) {
-    let head: String = present.iter().map(|w| w.to_line() + "\n").collect();
-    let recent: String = tail(path, max_bytes).map(|l| l + "\n").collect();
+    let recent: Vec<String> = tail(path, max_bytes).collect();
+    let held: std::collections::HashSet<String> = recent
+        .iter()
+        .filter_map(|l| crate::connection::read(l).ok())
+        .filter(Word::is_fact)
+        .map(|w| w.kind)
+        .collect();
+    let head: String = present
+        .iter()
+        .filter(|w| !held.contains(&w.kind))
+        .map(|w| crate::connection::line(w) + "\n")
+        .collect();
+    let recent: String = recent.into_iter().map(|l| l + "\n").collect();
     // ATOMIC: write a sibling .tmp, fsync it, then rename over the log. This file is the ONLY
     // persistent copy of the present facts; a plain truncate+write
     // would lose everything if we died between the two. rename() on the same dir is atomic.
