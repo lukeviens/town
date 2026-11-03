@@ -8,20 +8,20 @@ function intent(kind, body) return { kind = kind, tense = "future",  body = body
 function fact(kind, body)   return { kind = kind, tense = "present", body = body } end
 function event(kind, body)  return { kind = kind, tense = "past",    body = body } end
 
--- files a resident keeps: read a whole file (nil if absent), emit one so a reader sees the old or
--- the new and never neither, and heal a missing one from make().
+-- files a resident keeps: read a whole file (nil if absent), post one so a reader sees the old or
+-- the new and never neither, and mend a missing one from make().
 function read(path)
   local f = io.open(path, "r"); if not f then return nil end
   local s = f:read("*a"); f:close(); return s
 end
-function emit(path, text)
+function post(path, text)
   local aside = path .. ".writing"
   local f = io.open(aside, "w"); if not f then return end
   f:write(text); f:close()
   os.rename(aside, path)
 end
-function heal(path, make)
-  if not read(path) then local t = make(); if t then emit(path, t) end end
+function mend(path, make)
+  if not read(path) then local t = make(); if t then post(path, t) end end
 end
 
 -- a string as one shell word. A quote inside it would close ours, so it is doubled the way sh
@@ -67,6 +67,19 @@ function after(ms, body)
   return intent("after", b)
 end
 
+-- join: a program town keeps talking to, as `kind`, the way `watch` is a file it keeps reading.
+-- As it starts, a bodiless past word of `kind` says so; then each line it says is a past word of
+-- `kind`, and each future word of `kind` is a line written to it. When it ends, a past `join` comes
+-- back carrying `code` and what was sent with it: to join it again is the resident's to say.
+-- Joining a kind again ends the one before; the town opening again ends it too, and a resident
+-- joins again as it opens.
+function join(kind, argv, body)
+  local b = {}   -- a copy: the caller's table may be said again
+  for k, v in pairs(body or {}) do b[k] = v end
+  b.as, b.argv = kind, argv
+  return intent("join", b)
+end
+
 -- on: a clause — match a word by kind, tense, and what it goes by; run act(w). `by = "id"` is a
 -- word whose body has that field; `by = { colour = "red" }` a word whose fields are these (`true`:
 -- any value).
@@ -95,14 +108,15 @@ function on(spec, act)
 end
 
 -- react: a resident from `on` clauses. Its `kinds` are the clauses' kinds, or every kind ("*") if
--- a clause names none; its `listen` runs the first matching clause. Add `watch` (or other fields)
--- to the returned table after, if needed.
+-- a clause names none, and `error` too if one names it; its `listen` runs the first matching
+-- clause. Add `watch` (or other fields) to the returned table after, if needed.
 function react(list)
-  local kinds, seen = {}, {}
+  local kinds, seen, all = {}, {}, false
   for _, c in ipairs(list) do
-    if not c.kind then kinds = { "*" }; break end
-    if not seen[c.kind] then seen[c.kind] = true; kinds[#kinds + 1] = c.kind end
+    if not c.kind then all = true
+    elseif not seen[c.kind] then seen[c.kind] = true; kinds[#kinds + 1] = c.kind end
   end
+  if all then kinds = seen.error and { "*", "error" } or { "*" } end
   return {
     kinds = kinds,
     listen = function(w)

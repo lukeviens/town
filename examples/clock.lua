@@ -1,10 +1,12 @@
--- clock: `work` runs a command without stopping the town. Its answer comes back as a past
--- `work`, carrying what was sent with it, so `by` knows which answer is clock's. What clock
--- learns, it keeps as a fact: `present` is the last one, `past` all of them lately. Asked, it
--- answers too: a past `time` with the asker's `id`.
+-- clock: ask it the time, and it runs `date` and tells you.
 --
---   town talk future time       a `clock` fact
---   town ask future time        the time, answered
+-- `work` runs a command without making the town wait. The result comes back later as a past
+-- `work`, with whatever you sent along, and `by` picks out clock's own. Each time is kept as a
+-- fact: `present` gives the last one, `past` the ones before. If the question has an `id`, the
+-- answer goes back as a past `time` with that `id`.
+--
+--   town talk future time       a new `clock` fact
+--   town ask future time        the time, as an answer
 
 return react{
   on({ kind = "time", tense = "future" }, function(w)

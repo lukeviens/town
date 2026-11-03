@@ -28,7 +28,7 @@
           options.town.programs = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ "${home}/.config/town" ];
-            description = "your town: Lua files, or folders of them, in order. yours to write.";
+            description = "your town: programs, or folders of them, in order. yours to write.";
           };
 
           config = {

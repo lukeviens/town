@@ -1,0 +1,29 @@
+#!/bin/sh
+# shout: say something, and it shouts it back in capitals.
+#
+# A resident can be any program, not only Lua. Its first line says what it hears; after that,
+# words go in and out as lines of JSON. It asks clock.lua the time as any resident would: it says
+# a future `time`, and listens for the past `time` that answers.
+#
+# sh has no JSON parser, so this finds fields with a pattern, and a quote in the text breaks it.
+#
+#   town talk future shout text=hi     a past `shouted`, HI
+#   town listen                        a `shouting` fact: when it started
+
+# the text of one field of the word just read
+field() { printf '%s\n' "$w" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+
+echo '{"kinds":["shout","time"]}'
+echo '{"kind":"time","tense":"future","body":{"id":"shout"}}'
+
+# every line starts with the word's kind and tense
+while read -r w; do
+  case $w in
+    '{"kind":"time","tense":"past"'*)
+      [ "$(field id)" = shout ] || continue
+      echo "{\"kind\":\"shouting\",\"body\":{\"since\":\"$(field now)\"}}" ;;
+    '{"kind":"shout"'*)
+      loud=$(field text | tr '[:lower:]' '[:upper:]')
+      echo "{\"kind\":\"shouted\",\"tense\":\"past\",\"body\":{\"text\":\"$loud\"}}" ;;
+  esac
+done

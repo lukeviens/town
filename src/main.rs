@@ -1,10 +1,10 @@
 //! town — a VM whose one instruction is the word, { kind, tense, body, when }, said on the square.
-//! Its programs are residents, Lua files at the paths it is opened with: they listen there and
+//! Its programs are residents, the files at the paths it is opened with: they listen there and
 //! talk back, and any other program may talk and listen there too. A fact, a present-tense word,
 //! folds into the present (the last of each kind) and is kept in the log; past and future words
 //! pass through.
 //!
-//!   town <path>…      open a town: Lua files, or folders of them, in order
+//!   town <path>…      open a town: programs, or folders of them, in order
 //!   town talk <word>  say a word
 //!   town listen       hear the words
 //!   town ask <word>   say a word, and wait for its answer
@@ -29,7 +29,7 @@ fn main() {
         None => {
             // a town is its programs: with none named, there is nothing to open
             eprintln!(
-                "usage: town <path>…        open a town: Lua files, or folders of them, in order
+                "usage: town <path>…        open a town: programs, or folders of them, in order
        town talk <word>     say a word
        town listen          hear the words
        town ask <word>      say a word, and wait for its answer"
@@ -71,14 +71,14 @@ fn main() {
         };
         let town = Town::new();
         town.compact(128 * 1024); // keep the past log bounded; only recent facts feed past()
-        town::work::obey(&town); // future `work` is run outside, off the runtime
+        town::work::answer(&town); // future `work`, `after` and `join`, answered off the runtime
         let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
         if let Err(e) = residents::install(&lua, &town) {
             eprintln!("town: {e}");
             std::process::exit(1);
         }
-        residents::open(&lua, &town, &programs);
-        residents::keep(&lua, &town, programs);
+        tokio::task::spawn_local(residents::ending(town.clone())); // programs stop with the town
+        residents::keep(&lua, &town, programs); // opens the town, and again on each change
         square::run(listener, town).await; // residents run alongside on the same runtime
     });
 }

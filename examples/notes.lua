@@ -1,14 +1,17 @@
--- notes: a file the town keeps. `heal` makes it if it is missing, `emit` writes it whole, and
--- `watch` says it as a fact each time it changes. `noted` is `own`ed: only notes says it.
+-- notes: each note you add becomes a line in a file.
 --
---   town talk past note text="buy milk"     a line in notes.txt, and the file said again
+-- `mend` makes the file if it is missing, and `post` writes it whole, so no one reads half of it.
+-- `watch` says the file as a fact whenever it changes. `own` keeps `noted` for notes alone: no
+-- one else may say it.
+--
+--   town talk past note text="buy milk"     a line added to notes.txt, and the file said again
 
 local file = (os.getenv("TMPDIR") or "/tmp/"):gsub("/?$", "/") .. "notes.txt"
-heal(file, function() return "" end)
+mend(file, function() return "" end)
 
 local notes = react{
   on({ kind = "note", tense = "past" }, function(w)
-    emit(file, read(file) .. w.body.text .. "\n")
+    post(file, read(file) .. w.body.text .. "\n")
     return event("noted", { text = w.body.text })
   end),
 }

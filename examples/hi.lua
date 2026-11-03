@@ -1,9 +1,11 @@
--- hi: a resident made of clauses. `on` hears a kind of word, and `react` answers with the
--- first clause that matches. `talk` says something more besides, and `after` asks town to wait:
--- its answer comes back when the time has gone, carrying what was sent.
+-- hi: say hello, and it says hi back, then bye a moment later.
 --
---   town talk hello from=me     a past `hi` back, the time asked of clock.lua, and a `bye` a
---                               moment later
+-- `on` picks out a kind of word, and `react` answers with the first `on` that matches. `talk`
+-- says more besides the answer. `after` waits without making the town wait: when the time is up,
+-- a past `after` comes back with whatever you sent along.
+--
+--   town talk hello from=me     a past `hi`, a question to clock.lua, and a `bye` half a second
+--                               later
 
 return react{
   on("hello", function(w)

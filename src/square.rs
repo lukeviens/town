@@ -3,13 +3,13 @@
 
 use std::rc::Rc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::{error::RecvError, Receiver};
 
 use crate::paths;
-use crate::town::Town;
+use crate::town::{Lines, Town};
 use crate::word::Word;
 
 pub async fn run(listener: UnixListener, town: Rc<Town>) {
@@ -27,11 +27,8 @@ pub async fn run(listener: UnixListener, town: Rc<Town>) {
 // `join` is what a long-lived program wants: one socket, no process per word.
 async fn at_square(conn: UnixStream, town: Rc<Town>) {
     let (r, w) = conn.into_split();
-    let mut lines = BufReader::new(r).lines();
-    let first = match lines.next_line().await {
-        Ok(Some(l)) => l,
-        _ => return,
-    };
+    let mut lines = Lines::new(r);
+    let Some(first) = lines.next().await else { return };
     match first.trim() {
         "listen" => news(w, &town, town.words.subscribe()).await,
         "join" => {
@@ -39,7 +36,7 @@ async fn at_square(conn: UnixStream, town: Rc<Town>) {
             let words = town.words.subscribe();
             let talker = town.clone();
             let heard = async move {
-                while let Ok(Some(line)) = lines.next_line().await {
+                while let Some(line) = lines.next().await {
                     said(&talker, &line);
                 }
             };
@@ -51,7 +48,7 @@ async fn at_square(conn: UnixStream, town: Rc<Town>) {
         }
         _ => {
             said(&town, &first);
-            while let Ok(Some(line)) = lines.next_line().await {
+            while let Some(line) = lines.next().await {
                 said(&town, &line);
             }
         }
@@ -61,13 +58,12 @@ async fn at_square(conn: UnixStream, town: Rc<Town>) {
 // a line from someone at the square: said in town if it is a word, and not one only town itself
 // makes
 fn said(town: &Town, line: &str) {
-    if line.trim().is_empty() {
-        return;
-    }
-    match serde_json::from_str::<Word>(line) {
-        Ok(word) if town.admits(&word) => town.talk(word),
-        Ok(word) => town.error("square", Some(&word.kind), "refused: only town makes those".into()),
-        Err(e) => town.error("square", None, format!("not a word: {e}")),
+    match town.hear("square", line) {
+        Some(word) if town.admits(&word) => town.talk(word),
+        Some(word) => {
+            town.error("square", Some(&word.kind), "refused: only town makes those".into())
+        }
+        None => {}
     }
 }
 
