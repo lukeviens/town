@@ -1,121 +1,169 @@
-//! town — a VM whose one instruction is the word, { kind, tense, body, when }, said on the square.
-//! Its programs are residents, the files at the paths it is opened with: they listen there and
-//! talk back, and any other program may talk and listen there too. A fact, a present-tense word,
-//! folds into the present (the last of each kind) and is kept in the log; past and future words
-//! pass through.
+//! town: a VM whose one instruction is the word, `{ kind, tense, body, when }`, said on the square.
 //!
-//!   town <path>…      open a town: programs, or folders of them, in order
-//!   town talk <word>  say a word
-//!   town listen       hear the words
-//!   town ask <word>   say a word, and wait for its answer
+//! - **a town**: its residents, the files at the paths it is opened with; they, and any other
+//!   program, talk and listen there.
+//! - **a fact**: a present word, folded into the present, the last of each kind, and logged; past
+//!   and future words pass through.
+//! - **watching**: town watches nothing; `reload` asks it to open a resident again as it is saved.
 
-// town itself is the library (src/lib.rs); this is how it is started, and reached from a shell
+// the binary: town started, and town reached from a shell; town is the library
+use town::body::Body;
+use town::parts::Parts;
 use town::town::Town;
-use town::{paths, residents, square};
+use town::word::{Tense, Word};
+use town::{paths, program, residents, square, voice};
+
+/// How town is called; said when it is called with nothing.
+const USAGE: &str = "\
+town <path>…                            open a town: residents, or folders of them, in order
+town talk <word>                        say a word, and go
+town listen [language] [for pattern…]   hear the words: the present, then each as it is said
+town ask <word>                         say a word, and wait for its answer";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `TOWN`: town itself, for its programs to call, `$TOWN talk`; one that names no file is
+    // replaced. And town's own programs, `town-watch` among them, beside it: first on its world's
+    // PATH, so it finds those it was built with, wherever it is
+    if let Ok(me) = std::env::current_exe() {
+        if !std::env::var_os("TOWN").is_some_and(|t| std::path::Path::new(&t).is_file()) {
+            std::env::set_var("TOWN", &me);
+        }
+        if let Some(beside) = me.parent() {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let paths = [beside.to_path_buf()].into_iter().chain(std::env::split_paths(&path));
+            if let Ok(path) = std::env::join_paths(paths) {
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
     match args.get(1).map(String::as_str) {
-        Some("talk") => return square::reach("talk", Some(said(&args[2..])), None),
-        Some("listen") => return square::reach("listen", None, args.get(2)),
-        // ask: say a word, wait for its answer, print it. TOWN_WAIT seconds (default 1800), else
-        // exit 1.
+        // talk: say a word and go; exit 1 if no town is at the square to hear it
+        Some("talk") => std::process::exit(if square::talk(&word(&args[2..])) { 0 } else { 1 }),
+        // listen: exit 1 if no town is at the square, 2 for arguments it cannot read
+        Some("listen") => std::process::exit(square::listen(&args[2..])),
+        // ask: wait TOWN_WAIT seconds (1800 if unset) for the answer, else exit 1; exit 2 for a
+        // word that cannot be asked
         Some("ask") => {
             let wait = std::env::var("TOWN_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
-            let answered = square::ask(said(&args[2..]), std::time::Duration::from_secs(wait));
-            std::process::exit(if answered { 0 } else { 1 });
+            std::process::exit(square::ask(word(&args[2..]), std::time::Duration::from_secs(wait)));
         }
         None => {
-            // a town is its programs: with none named, there is nothing to open
-            eprintln!(
-                "usage: town <path>…        open a town: programs, or folders of them, in order
-       town talk <word>     say a word
-       town listen [language] hear the words
-       town ask <word>      say a word, and wait for its answer"
-            );
+            // a town is its residents: with none named, there is nothing to open
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
         Some(_) => {}
     }
-    // never boot on a path that is not there — a misspelled verb included — rather than open half
-    // a town
-    let programs: Vec<std::path::PathBuf> =
-        args[1..].iter().map(std::path::PathBuf::from).collect();
-    if let Some(missing) = programs.iter().find(|p| !p.exists()) {
-        eprintln!("town: no such program: {}", missing.display());
+    // a missing path, a misspelled verb among them, opens no town rather than half of one; each
+    // is made whole as the town keeps it (`residents::keep`)
+    let paths: Vec<std::path::PathBuf> = args[1..].iter().map(std::path::PathBuf::from).collect();
+    if let Some(missing) = paths.iter().find(|p| !p.exists()) {
+        eprintln!("town: no such resident: {}", missing.display());
         std::process::exit(2);
     }
-    // whole, but a link left as it is: it is followed each time the town opens, so a moved one is
-    // seen
-    let programs: Vec<std::path::PathBuf> =
-        programs.iter().map(|p| std::path::absolute(p).unwrap_or(p.clone())).collect();
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let path = paths::square();
-        // don't steal a live square — if one already answers, we're already up
+        // a square that answers is a town already up: it is not taken from it
         if std::os::unix::net::UnixStream::connect(&path).is_ok() {
             eprintln!("town: already up");
             return;
         }
-        std::fs::remove_file(&path).ok(); // no one home; clear any stale socket
-        let listener = match tokio::net::UnixListener::bind(&path) {
+        std::fs::remove_file(&path).ok(); // none answers: a socket left there is let go
+        let square = match tokio::net::UnixListener::bind(&path) {
             Ok(l) => l,
             Err(e) => {
-                // no one answered, so it is not taken: say why it would not open
-                // a failure, so launchd tries again; only `already up` is a clean exit
+                // a failure, so launchd tries again; only `already up` ends well
                 eprintln!("town: cannot open the square at {}: {e}", path.display());
                 std::process::exit(1);
             }
         };
-        let town = Town::new();
-        town.compact(); // keep the past log bounded; only recent facts feed past()
-        town::work::answer(&town); // future `work`, `after` and `join`, answered off the runtime
-        let lua = unsafe { mlua::Lua::unsafe_new() }; // trusted programs; full stdlib
-        if let Err(e) = town::lua::install(&lua, &town) {
-            eprintln!("town: {e}");
-            std::process::exit(1);
-        }
-        tokio::task::spawn_local(residents::ending(town.clone())); // programs stop with the town
-        residents::keep(&lua, &town, programs); // opens the town, and again on each change
-        square::run(listener, town).await; // residents run alongside on the same runtime
+        let town = Town::with_log(paths::past());
+        // the log, bounded: the present, and the recent past `past` reads
+        town.compact();
+        // programs stop with the town
+        tokio::task::spawn_local(program::ending(town.clone()));
+        // opens the town, and each resident again as it is saved; the whole town in a new Lua each
+        // time: its residents are trusted, so all of Lua's own
+        residents::keep(|| unsafe { mlua::Lua::unsafe_new() }, &town, paths);
+        square::run(square, town).await; // residents run alongside on the same runtime
     });
 }
 
-// A word to talk, from the command line: JSON as it is, or `[TENSE] KIND key=value …`, said in
-// `words`, town's own language for a word on a line, so town reads it as it reads any language.
-// TENSE is an optional leading `past`/`present`/`future`; without it, a present fact.
-fn said(args: &[String]) -> square::Said {
+/// `said`, or an exit saying why not and how a word is said
+fn word(args: &[String]) -> Word {
+    said(args).unwrap_or_else(|e| {
+        eprintln!("town: {e}");
+        eprintln!("a word is a line of JSON, or [past|present|future] <kind> key=value …");
+        std::process::exit(2);
+    })
+}
+
+/// A word from the command line: a line of JSON, or said short, `[tense] kind key=value …`,
+/// present if no tense is said, its body the pairs as text, or none. Else why it is no word.
+fn said(args: &[String]) -> Result<Word, String> {
     if let Some(json) = args.first().filter(|a| a.starts_with('{')) {
-        return square::Said::Json(json.clone());
+        return voice::read(json).map_err(|e| format!("not a word: {e}"));
     }
-    // Tense is the word's, never the body's. Written here it is silently ignored: the word goes out
-    // as a present fact, folds into the present forever, and carries the tense it meant as data.
-    // (`kind` can be a real body field; `tense` never is.)
+    // tense is the word's: as a pair it would make a fact holding the tense it meant, so it is
+    // refused
     if args.iter().any(|a| a.starts_with("tense=")) {
-        eprintln!("town: tense belongs to the word, not its body.");
-        eprintln!("town talk [past|present|future] <kind> key=value …");
-        std::process::exit(2);
+        return Err("tense belongs to the word, not its body".into());
     }
-    // what follows the kind is its body, key=value each: anything else is no word
-    let tensed = ["past", "present", "future"].contains(&args.first().map_or("", String::as_str));
-    if args.len() == tensed as usize {
-        eprintln!("town: a word has a kind");
-        eprintln!("town talk [past|present|future] <kind> key=value …");
-        std::process::exit(2);
+    let tense = args.first().and_then(|t| Tense::named(t));
+    let Some((kind, pairs)) = args[tense.is_some() as usize..].split_first() else {
+        return Err("a word has a kind".into());
+    };
+    let mut body = Parts::map::<&str, Parts>([]);
+    for pair in pairs {
+        match pair.split_once('=') {
+            Some((key, value)) if !key.is_empty() => body.set(key, value),
+            _ => return Err(format!("`{pair}` is not key=value")),
+        }
     }
-    if let Some(bad) =
-        args.iter().skip(1 + tensed as usize).find(|a| !a.contains('=') || a.starts_with('='))
-    {
-        eprintln!("town: `{bad}` is not key=value");
-        eprintln!("town talk [past|present|future] <kind> key=value …");
-        std::process::exit(2);
+    let body = if pairs.is_empty() { Body::none() } else { Body::of(body) };
+    Ok(Word::new(kind.as_str(), tense.unwrap_or(Tense::Present), body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn said(args: &[&str]) -> Result<Word, String> {
+        super::said(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
     }
-    // a tab or a line's end would end a word in `words`, or a part of one: such a word goes as JSON
-    if args.iter().any(|a| a.contains(['\t', '\n'])) {
-        eprintln!("town: a tab or a line's end cannot be said short; say the word in JSON");
-        std::process::exit(2);
+
+    // a word said short: its tense, else present; its kind; its pairs as text, `=` and tabs and
+    // all; or no body
+    #[test]
+    fn a_word_is_said_short() {
+        let w = said(&["past", "shout", "text=hi\tthere", "n=", "eq=a=b"]).unwrap();
+        assert_eq!((w.kind.as_str(), w.tense), ("shout", Tense::Past));
+        let body = serde_json::json!({ "text": "hi\tthere", "n": "", "eq": "a=b" });
+        assert_eq!(w.body, Body::of(body));
+        let w = said(&["pastry"]).unwrap();
+        assert_eq!((w.kind.as_str(), w.tense, w.body.is_none()), ("pastry", Tense::Present, true));
+        assert_eq!(said(&["future", "a=b"]).unwrap().kind, "a=b", "a kind is any text");
     }
-    square::Said::Words(args.to_vec())
+
+    // or in JSON, as town reads any line; and what is no word is refused, and why
+    #[test]
+    fn a_word_is_said_in_json_or_refused() {
+        let w = said(&[r#"{"kind":"q","tense":"future","body":{"a":1}}"#]).unwrap();
+        assert_eq!((w.kind.as_str(), w.tense), ("q", Tense::Future));
+        for (args, why) in [
+            (&[r#"{"kind":"q","x":1}"#][..], "not a word"),
+            (&[], "a word has a kind"),
+            (&["past"], "a word has a kind"),
+            (&["note", "text"], "`text` is not key=value"),
+            (&["note", "=x"], "`=x` is not key=value"),
+            (&["note", "tense=past"], "tense belongs to the word"),
+        ] {
+            let e = said(args).unwrap_err();
+            assert!(e.contains(why), "{args:?}: {e}");
+        }
+    }
 }

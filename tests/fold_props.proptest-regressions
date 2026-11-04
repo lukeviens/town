@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 13c64a474b3298430ed69f2d55c95c36929bebc072812320e1b2a6191ec8ef75 # shrinks to ws = [Word { kind: ".", tense: Present, body: Bool(false), when: 0 }]

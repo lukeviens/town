@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use town::body::Body;
 use town::parts::Parts;
+use town::residents;
+use town::town::Town;
+use town::word::{Tense, Word};
+
+use town::testing::{run, scratch, until, world_with};
 
 /// a body, to look into
 trait Look {
@@ -19,38 +24,35 @@ impl Look for Body {
         serde_json::to_value(self.parts()).unwrap()
     }
 }
-use town::residents;
-use town::town::Town;
-use town::word::{Tense, Word};
 
-#[path = "../src/testing.rs"]
-#[allow(dead_code)] // the examples need only some of it
-mod testing;
-use testing::until;
-
+/// a word, its body as json
 fn word(kind: &str, tense: Tense, body: Value) -> Word {
     Word::new(kind, tense, Body::of(body))
 }
 
+// each example, opened as one town, answers as its header says
 #[test]
 fn the_examples_answer_as_they_say() {
-    let dir = std::env::temp_dir().join(format!("town-examples-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("TMPDIR", &dir); // where notes.lua keeps its file
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    tokio::task::LocalSet::new().block_on(&rt, async {
-        let town = Town::with_log(dir.join("past.log"));
+    let dir = scratch();
+    // its world: town's own programs on its PATH, the watch among them, and where notes.lua keeps
+    // its file
+    let mut world = world_with(Path::new(env!("CARGO_BIN_EXE_town-watch")));
+    world.insert("TMPDIR".into(), dir.as_os_str().into());
+    run(async {
+        let town = Town::in_world(dir.log(), world);
         let lua = mlua::Lua::new();
         town::lua::install(&lua, &town).unwrap();
-        town::work::answer(&town);
-        let mut words = town.words.subscribe();
-        let mut shouts = town.words.subscribe(); // shout begins as the town opens
-        residents::open(&lua, &town, &[Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")]);
+        let mut words = town.words.listen();
+        // shout begins as the town opens
+        let mut shouts = town.words.listen();
+        // town's own residents, the languages they speak among them, then them
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        residents::open(&lua, &town, &[residents::own(), examples]);
         until(&mut words, |w| w.kind == "notes").await; // notes.lua is up: its file, said
 
         // hello: a hi, the time it asked for, from clock, and a bye once its wait has gone
         let asked = Instant::now();
-        town.talk(word("hello", Tense::Present, json!({ "from": "me" })));
+        town.talk(word("hello", Tense::Past, json!({ "from": "me" })));
         let hi = until(&mut words, |w| w.kind == "hi").await;
         assert_eq!(hi.tense, Tense::Past);
         assert_eq!(hi.body, Parts::from(json!({ "to": "me" })));
@@ -69,12 +71,16 @@ fn the_examples_answer_as_they_say() {
         // notes: the line is written, the file said again, once, and `noted` is notes.lua's alone
         town.talk(word("note", Tense::Past, json!({ "text": "buy milk" })));
         until(&mut words, |w| w.kind == "noted" && w.body.value()["text"] == "buy milk").await;
-        until(&mut words, |w| w.kind == "notes" && w.body == "buy milk\n").await;
+        let size = |w: &Word| w.body.value()["size"].as_u64();
+        until(&mut words, |w| w.kind == "notes" && size(w) == Some("buy milk\n".len() as u64))
+            .await;
         // and once: the file said next is the next note's
         town.talk(word("note", Tense::Past, json!({ "text": "eggs" })));
         let next = until(&mut words, |w| w.kind == "notes").await;
-        assert_eq!(next.body, "buy milk\neggs\n");
-        assert!(!town.admits(&word("noted", Tense::Past, Value::Null)));
+        assert_eq!(size(&next), Some("buy milk\neggs\n".len() as u64));
+        assert!(town
+            .may(&word("noted", Tense::Past, Value::Null), &town.who("square", true))
+            .is_err());
 
         // echo: what goes into `cat` comes back out
         town.talk(word("say", Tense::Future, json!({ "text": "hi" })));
@@ -88,9 +94,6 @@ fn the_examples_answer_as_they_say() {
         let shouted = until(&mut words, |w| w.kind == "shouted").await;
         assert_eq!(shouted.body, Parts::from(json!({ "text": "HI" })));
 
-        for h in town.tasks.borrow_mut().drain(..) {
-            h.abort();
-        }
+        town.reopen();
     });
-    std::fs::remove_dir_all(&dir).ok();
 }

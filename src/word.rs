@@ -1,5 +1,7 @@
-//! A word: a kind, a tense, a body. Only present words fold into the present;
-//! past/future pass through.
+//! A word: a kind, a tense, a body, and when it was said. The README's *words*.
+//!
+//! - **present**: folds into the present.
+//! - **past**, **future**: pass through.
 
 use crate::body::Body;
 
@@ -8,8 +10,12 @@ pub struct Word {
     pub kind: String,
     pub tense: Tense,
     pub body: Body,
-    /// When it was said, ms since the epoch; the town stamps it as it talks. 0 = not yet said.
+    /// When it was said, in ms since the epoch, stamped by town as it comes in by the door, or is
+    /// talked; 0 until then.
     pub when: u64,
+    /// Who said it, or whose error it says, by the number town gave them; 0 is town itself.
+    /// Town's own to know: no language says it.
+    pub by: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,12 +42,80 @@ impl Tense {
 impl Word {
     /// A word not yet said: town stamps `when` as it talks it.
     pub fn new(kind: impl Into<String>, tense: Tense, body: Body) -> Word {
-        Word { kind: kind.into(), tense, body, when: 0 }
+        Word { kind: kind.into(), tense, body, when: 0, by: 0 }
     }
 
-    /// A fact: a present-tense word with a kind. Only facts fold into the present and are
-    /// worth keeping in the log; events (past) and intentions (future) just pass through.
+    /// That the present is told, and what follows is now: a bodiless past word at `""`, where the
+    /// listener stands. It is written to a listener, never said in town, and `""` is no kind.
+    pub fn now() -> Word {
+        Word::new("", Tense::Past, Body::none())
+    }
+
+    /// Whether this is the word that says what follows is now.
+    pub fn is_now(&self) -> bool {
+        self.kind.is_empty() && self.tense == Tense::Past && self.body.is_none()
+    }
+
+    /// A fact: a present word of a kind, which folds into the present and is logged.
     pub fn is_fact(&self) -> bool {
-        self.tense == Tense::Present && !self.kind.is_empty()
+        self.tense == Tense::Present && is_kind(&self.kind)
+    }
+}
+
+/// What a kind is, as town says when it is not one.
+pub const KIND: &str = "a path, each part of it something, and none `.` or `..`";
+
+/// Whether `kind` names one kind: a path with no part empty, `.` or `..`, as `nvim/` names what is
+/// under it and `..` somewhere else. `nvim/1`, never `nvim/`, `/nvim`, `nvim//1` or `nvim/../x`.
+pub fn is_kind(kind: &str) -> bool {
+    kind.split('/').all(|part| !["", ".", ".."].contains(&part))
+}
+
+/// Where what hears `kind` stands, however it reads it: `nvim` for `nvim`, `nvim/` or `/nvim`, and
+/// the root, nothing, for `/`.
+pub fn place(kind: &str) -> &str {
+    kind.trim_matches('/')
+}
+
+/// What failed. Every other word is said on purpose; an error is made by one before it, so errors
+/// alone could go on without end, each making the next. It is heard only where it is named.
+pub const ERROR: &str = "town/error";
+
+/// Whether what hears `kind` hears a word of kind `said`, town's one rule: `nvim` is `nvim`;
+/// `nvim/`, what is under it; `/nvim`, both; `/`, every kind. But `ERROR` only where it is named.
+pub fn hears(kind: &str, said: &str) -> bool {
+    if said == ERROR && place(kind) != ERROR {
+        return false;
+    }
+    let (down, kind) = kind.strip_prefix('/').map_or((false, kind), |k| (true, k));
+    let (under, kind) = kind.strip_suffix('/').map_or((false, kind), |k| (true, k));
+    let below = kind.is_empty() || said.strip_prefix(kind).is_some_and(|r| r.starts_with('/'));
+    (said == kind && !under) || ((down || under) && below)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hears, is_kind};
+
+    // a kind is itself; with `/` after, what is under it; with `/` before, both; `/`, every kind
+    #[test]
+    fn a_kind_is_heard_as_a_path_is_read() {
+        assert!(hears("nvim", "nvim") && !hears("nvim", "nvim/1") && !hears("nvim", "nvimx"));
+        assert!(hears("nvim/", "nvim/1") && hears("nvim/", "nvim/a/b"));
+        assert!(!hears("nvim/", "nvim") && !hears("nvim/", "nvimx"));
+        assert!(hears("/nvim", "nvim") && hears("/nvim", "nvim/a/b") && !hears("/nvim", "nvimx"));
+        assert!(!hears("/nvim/1", "nvim") && !hears("/nvim/1", "nvim/2"));
+        assert!(hears("/", "note") && hears("/", "nvim/1") && hears("town/error", "town/error"));
+        assert!(!hears("/", "town/error") && !hears("/town", "town/error"), "a failure is named");
+        assert!(hears("/town/error", "town/error") && hears("/town", "town/residents/x"));
+    }
+
+    // a kind is a path that means only itself: no part of it empty, `.` or `..`
+    #[test]
+    fn a_kind_is_a_path_that_means_itself() {
+        assert!(is_kind("nvim") && is_kind("nvim/1") && is_kind("a.b/c d"));
+        for not in ["", "/", "nvim/", "/nvim", "nvim//1", "./nvim", "nvim/..", "a/../b"] {
+            assert!(!is_kind(not), "{not:?}");
+        }
     }
 }

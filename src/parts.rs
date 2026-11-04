@@ -1,6 +1,6 @@
-//! Parts: what a body holds, in town's own terms. A part is nothing, text, bytes, a number, true or
-//! false, parts in order, or parts by name. A language reads bytes as parts and writes parts as
-//! bytes; how any language writes them is its own.
+//! Parts: what a body holds, in town's own terms: nothing, text, bytes, a number, true or false, a
+//! list, or parts by name. A language reads bytes as parts and writes parts as bytes, each its own
+//! way.
 
 use std::fmt;
 
@@ -24,7 +24,7 @@ pub enum Parts {
 }
 
 impl Parts {
-    /// parts by name, from pairs of a name and a part
+    /// parts by name, from pairs
     pub fn map<N: Into<String>, P: Into<Parts>>(pairs: impl IntoIterator<Item = (N, P)>) -> Parts {
         let mut map = Parts::Map(Vec::new());
         for (name, part) in pairs {
@@ -37,7 +37,7 @@ impl Parts {
         matches!(self, Parts::None)
     }
 
-    /// the part named `name`, if these are parts by name and it is there
+    /// a part, by name, if these are parts by name
     pub fn get(&self, name: &str) -> Option<&Parts> {
         match self {
             Parts::Map(m) => m.iter().find(|(n, _)| n == name).map(|(_, p)| p),
@@ -57,7 +57,7 @@ impl Parts {
         }
     }
 
-    /// take away the part named `name`
+    /// take away a part, by name
     pub fn remove(&mut self, name: &str) {
         if let Parts::Map(m) = self {
             m.retain(|(n, _)| n != name);
@@ -144,12 +144,6 @@ impl From<f64> for Parts {
     }
 }
 
-impl From<Vec<Parts>> for Parts {
-    fn from(l: Vec<Parts>) -> Parts {
-        Parts::List(l)
-    }
-}
-
 /// parts as any serde language writes them: what the JSON language is built on
 impl Serialize for Parts {
     fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
@@ -233,12 +227,20 @@ impl<'de> Visitor<'de> for Reading {
         }
         Ok(Parts::List(l))
     }
+    /// as `set` names each, the last of a name in the place of the first, but each found once, by
+    /// where it is: however many parts, each costs the same
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Parts, A::Error> {
-        let mut m = Parts::Map(Vec::new());
+        let (mut m, mut at) = (Vec::new(), std::collections::HashMap::new());
         while let Some((n, p)) = map.next_entry::<String, Parts>()? {
-            m.set(n, p);
+            match at.get(&n) {
+                Some(&i) => m[i] = (n, p),
+                None => {
+                    at.insert(n.clone(), m.len());
+                    m.push((n, p));
+                }
+            }
         }
-        Ok(m)
+        Ok(Parts::Map(m))
     }
 }
 
@@ -258,5 +260,33 @@ mod tests {
         assert_eq!(c.get("bg").and_then(Parts::text), Some("#111"));
         assert_ne!(a, c);
         assert!(Parts::from(f64::NAN).is_none());
+    }
+
+    // parts by name are read as `set` names them, the last of a name in the place of the first;
+    // and each found once, so many names read as fast as few, each
+    #[test]
+    fn parts_by_name_are_read_once_each() {
+        let read: Parts = serde_json::from_str(r#"{"a":1,"b":2,"a":3}"#).unwrap();
+        let Parts::Map(m) = &read else { panic!("parts by name") };
+        let names: Vec<&str> = m.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!((names, read.get("a")), (vec!["a", "b"], Some(&Parts::from(3i64))));
+        // a name looked for among all held costs n² compares; found by where it is, n
+        let many = |n: usize| {
+            let body: Vec<String> = (0..n).map(|i| format!("\"k{i}\":0")).collect();
+            format!("{{{}}}", body.join(","))
+        };
+        // the least of three, so a busy moment is not taken for the work
+        let took = |n: usize| {
+            let json = many(n);
+            let once = || {
+                let t = std::time::Instant::now();
+                let read: Parts = serde_json::from_str(&json).unwrap();
+                assert_eq!(read.get(&format!("k{}", n - 1)), Some(&Parts::from(0i64)));
+                t.elapsed()
+            };
+            (0..3).map(|_| once()).min().unwrap()
+        };
+        let (few, lots) = (took(2_000), took(20_000));
+        assert!(lots < few * 40, "ten times the names, ten times the work: {few:?}, {lots:?}");
     }
 }

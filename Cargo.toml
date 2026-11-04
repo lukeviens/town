@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "a little VM with one instruction: the word."
 license = "MIT"
+default-run = "town"
 repository = "https://github.com/lukeviens/town"
 
 [[bin]]
@@ -14,13 +15,18 @@ path = "src/main.rs"
 tokio = { version = "1", features = [
   "rt", "time", "net", "sync", "io-util", "macros", "process", "signal",
 ] }
-mlua = { version = "0.10", features = ["lua54", "vendored", "async"] }
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 notify = "6"
 libc = "0.2"
 
+[features]
+# what tests are written with: here, and in a town's own tests, which name it
+testing = []
+
 [dev-dependencies]
+town = { path = ".", features = ["testing"] }
 proptest = "1"
 
 [profile.release]

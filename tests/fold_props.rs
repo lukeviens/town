@@ -1,20 +1,20 @@
-//! Property tests over the pure word + fold core — the invariants residents and the
-//! present depend on. These generate thousands of random word sequences per run.
-//!   cargo test --test fold_props
+//! Properties of words and the fold, over many random words: what residents and the present rest
+//! on. `cargo test --test fold_props`
 
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use serde_json::Value;
 use town::body::Body;
+use town::testing;
 use town::town::{fold, Town};
-use town::word::{Tense, Word};
+use town::word::{is_kind, Tense, Word};
 
 fn arb_tense() -> impl Strategy<Value = Tense> {
     prop_oneof![Just(Tense::Past), Just(Tense::Present), Just(Tense::Future)]
 }
 
-// Bodies across the whole JSON space — null / bool / int / string / arrays / objects.
+// a body of any JSON: null, bool, number, text, list or map
 fn arb_body() -> impl Strategy<Value = Value> {
     let leaf = prop_oneof![
         Just(Value::Null),
@@ -31,18 +31,18 @@ fn arb_body() -> impl Strategy<Value = Value> {
     })
 }
 
-// Kinds: empty, plain, and arbitrary unicode (JSON-escaping stress).
+// a word of any tense and body, its kind empty, plain, a path, or any text, to be escaped
 fn arb_word() -> impl Strategy<Value = Word> {
-    (prop_oneof![Just(String::new()), "[a-z]{1,6}", ".*"], arb_tense(), arb_body())
+    (prop_oneof![Just(String::new()), "[a-z]{1,6}", "[a-z./]{1,6}", ".*"], arb_tense(), arb_body())
         .prop_map(|(kind, tense, body)| Word::new(kind, tense, Body::of(body)))
 }
 
-// An independent reference for the fold: last present, non-empty-kind word wins, and one with no
-// body takes its kind away.
+// the fold, apart from town's: the last present word of a kind wins, and one with no body takes
+// its kind away; a word of no kind, `""` or `a//b`, is none of the present
 fn reference_fold(ws: &[Word]) -> BTreeMap<String, Body> {
     let mut m = BTreeMap::new();
     for w in ws {
-        if w.tense == Tense::Present && !w.kind.is_empty() {
+        if w.tense == Tense::Present && is_kind(&w.kind) {
             if w.body.is_none() {
                 m.remove(&w.kind);
             } else {
@@ -54,66 +54,39 @@ fn reference_fold(ws: &[Word]) -> BTreeMap<String, Body> {
 }
 
 proptest! {
-    // no input — valid or garbage — can panic the parser or the serializer.
+    // no line, a word or not, panics the reader
     #[test]
-    fn from_line_never_panics(s in ".*") {
-        let _ = town::connection::read(&s);
-    }
-    #[test]
-    fn to_line_never_panics(w in arb_word()) {
-        let _ = town::connection::line(&w);
+    fn reading_never_panics(s in ".*") {
+        let _ = town::voice::read(&s);
     }
 
-    // from_line ∘ to_line is the identity on (kind, tense, body).
+    // a word written as a line reads back as itself: its kind, tense and body
     #[test]
-    fn roundtrip_is_identity(w in arb_word()) {
-        let back = town::connection::read(&town::connection::line(&w)).expect("a word said is read back");
+    fn a_word_reads_back_as_itself(w in arb_word()) {
+        let back = town::voice::read(&town::voice::line(&w));
+        let back = back.expect("a word said is read back");
         prop_assert_eq!(&back.kind, &w.kind);
         prop_assert_eq!(back.tense, w.tense);
         prop_assert_eq!(&back.body, &w.body);
     }
 
-    // fold == the reference: last-wins per kind, over facts only (present + non-empty kind), and
-    // a fact of nothing forgets.
+    // town's fold is the reference fold, of any words
     #[test]
     fn fold_matches_reference(ws in prop::collection::vec(arb_word(), 0..64)) {
         prop_assert_eq!(fold(ws.clone().into_iter()), reference_fold(&ws));
     }
 
-    // the invariant residents rely on: the present a town keeps as it talks == the fold of every
-    // word so far, at EVERY prefix; and a town rebuilt from its log keeps the same.
+    // the present a town keeps as it talks is the fold of every word so far, after each word; and
+    // a town rebuilt from its log keeps the same
     #[test]
     fn present_equals_fold_at_every_prefix(ws in prop::collection::vec(arb_word(), 0..48)) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let log = std::env::temp_dir().join(format!("town-prop-{}-{n}.log", std::process::id()));
-        let town = Town::with_log(log.clone());
-        for i in 0..ws.len() {
-            town.talk(ws[i].clone());
+        let dir = testing::scratch();
+        let town = Town::with_log(dir.log());
+        for (i, w) in ws.iter().enumerate() {
+            town.talk(w.clone());
             prop_assert_eq!(&*town.present.borrow(), &fold(ws[..=i].iter().cloned()));
         }
-        let rebuilt = Town::with_log(log.clone());
+        let rebuilt = Town::with_log(dir.log());
         prop_assert_eq!(&*rebuilt.present.borrow(), &*town.present.borrow());
-        std::fs::remove_file(&log).ok();
-    }
-
-    // distinct kinds ⇒ the fold is order-independent (no cross-kind interference).
-    #[test]
-    fn distinct_kinds_fold_order_independently(
-        mut ws in prop::collection::vec(arb_word(), 0..24),
-        seed in any::<u64>(),
-    ) {
-        for (i, w) in ws.iter_mut().enumerate() {
-            w.kind = format!("k{i}");   // force distinct, non-empty kinds
-            w.tense = Tense::Present;
-        }
-        let folded = fold(ws.clone().into_iter());
-        let mut rng = seed;                        // deterministic Fisher–Yates shuffle
-        for i in (1..ws.len()).rev() {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ws.swap(i, (rng >> 33) as usize % (i + 1));
-        }
-        prop_assert_eq!(folded, fold(ws.into_iter()));
     }
 }

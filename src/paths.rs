@@ -1,4 +1,8 @@
-//! Paths: the square and the past live in ~/.cache/town; a town's programs are wherever it is told.
+//! Town's home: where it keeps the square and the log.
+//!
+//! - **as it is**: `~/.town`.
+//! - **another**: `TOWN_HOME`. Set it, too, for every program that reaches the square, or it finds
+//!   no town there.
 
 use std::path::PathBuf;
 
@@ -6,12 +10,11 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").expect("town needs $HOME set"))
 }
 
-/// town's own folder: the square and the log. Yours alone (700): what was said is no one else's
-/// to read.
-fn cache() -> PathBuf {
+/// town's own folder, yours alone (700): what was said is no one else's to read.
+fn town_home() -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     static MADE: std::sync::Once = std::sync::Once::new();
-    let d = home().join(".cache/town");
+    let d = std::env::var_os("TOWN_HOME").map_or_else(|| home().join(".town"), PathBuf::from);
     MADE.call_once(|| {
         if let Err(e) = std::fs::create_dir_all(&d) {
             eprintln!("town: cannot create {}: {e}", d.display());
@@ -22,9 +25,9 @@ fn cache() -> PathBuf {
 }
 
 pub fn square() -> PathBuf {
-    cache().join("square.sock")
+    town_home().join("square.sock")
 }
 
 pub fn past() -> PathBuf {
-    cache().join("past.log")
+    town_home().join("past.log")
 }

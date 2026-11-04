@@ -1,19 +1,21 @@
--- resident — how a resident is written: the three tenses, the clauses it listens with, the work
--- it asks for, the files it writes, and the languages it speaks. Built into town and loaded
--- before any of a town's own files, so every town starts from the same words.
+-- resident: how a resident is written, the same in every town, loaded before a town's own files.
+-- The README's *in Lua*.
 
--- the three tenses, one constructor each, so no resident hand-types a `tense` string (a typo'd
--- tense is no word). intent = future, fact = present, event = past.
+-- a word in each tense, so none types a tense by hand: a typo is no word
 function intent(kind, body) return { kind = kind, tense = "future",  body = body } end
 function fact(kind, body)   return { kind = kind, tense = "present", body = body } end
 function event(kind, body)  return { kind = kind, tense = "past",    body = body } end
 
--- languages: how bytes are read as a body's parts, and parts written as bytes, one grammar run both
--- ways, over a stream: what has not all come yet is waited for. In a `seq` or a `choice`, a string
--- is those bytes, and `{ name = g }` names what g reads. A seq is the parts named within it; with
--- none, what its one other piece reads. A string named is kept. A language is said as a word, a
--- past `language` { name, grammar }, which `language(name, grammar)` says; `parts(name, bytes)`
--- reads with one, and `bytes(name, parts)` writes, as does `as` on the files.
+-- languages: a grammar, run both ways, reads bytes as parts and writes parts as bytes; what has
+-- not all come yet is waited for. The README's *languages*.
+--
+-- - in a `seq` or a `choice`: a string is those bytes; `{ name = g }` names what g reads; a string
+--   named is kept.
+-- - a seq: the parts named within it; with none, what its one other piece reads.
+-- - a resident that is one says so, `{ languages = { kv = grammar } }`, and it is spoken while it
+--   is here; a version is a name under it, `kv/2`.
+-- - `parts(name, bytes)` reads with one, `bytes(name, parts)` writes, and so does `as` on the
+--   files.
 -- each piece is marked as one, so `{ name = g }` is a part whatever its name: `text`, `map`, `int`
 local piece = {}
 local function made(t) return setmetatable(t, piece) end
@@ -30,9 +32,6 @@ local function items(gs)
   local out = {}; for i, g in ipairs(gs) do out[i] = item(g) end; return out
 end
 local function counted(g, n) if n then return { item(g), n } end; return item(g) end
-function language(name, grammar)
-  talk(event("language", { name = name, grammar = item(grammar) }))
-end
 function upto(s)      return made{ upto = s } end             -- text up to s, which is passed over
 function but(s)       return made{ but = s } end              -- text of a byte or more, none in s
 function seq(gs)      return made{ seq = items(gs) } end      -- each in turn
@@ -40,8 +39,8 @@ function choice(gs)   return made{ choice = items(gs) } end   -- the first that 
 function many(g, n)   return made{ many = counted(g, n) } end -- as many as read, or n, in order
 function map(g, n)    return made{ map = counted(g, n) } end  -- the same, by `key`: each a `value`
 function unless(g)    return made{ unless = item(g) } end     -- nothing, where g would not read
--- a whole number: { size = bytes, signed, order = "big"|"little", from, to, base }, from and to
--- bounding what the bytes hold, and read as that less base
+-- a whole number: { size = bytes, signed, order = "big"|"little", from, to, base, negative }, from
+-- and to bounding what the bytes hold, and read as that less base; or, negative, as base less that
 function int(o)       return made{ int = o or {} } end
 function float(o)     return made{ float = o or {} } end      -- { size = 2|4|8, order }
 -- a count, n, is a number; a piece that reads one; or the name of a part read before it in the
@@ -53,20 +52,9 @@ function whole(g)     return made{ whole = item(g) } end      -- what g reads in
 function be(g, value) return made{ be = { item(g), value } } end
 function ref(name)    return made{ ref = name } end           -- the language of that name
 
--- words: a word on a line, as a shell says one: `[tense] kind key=value …`, a tab between each, its
--- tense present if it is not said. The one language town speaks itself but JSON, for its CLI. What
--- a tab or a line's end is in cannot be said in it.
-local pair = seq{ "\t", { key = but("=\t\n") }, "=", { value = choice{ but("\t\n"), "" } } }
-language("words", seq{
-  choice{ seq{ { tense = choice{ "past", "present", "future" } }, "\t" }, "" },
-  { kind = but("\t\n") },
-  { body = choice{ map(pair), "" } },
-  "\n",
-})
-
 -- files a resident keeps: read a whole file (nil if absent), post one so a reader sees the old or
 -- the new and never neither, and mend a missing one from make(). With `as`, a file is the parts of
--- that language, not text.
+-- that language, not text. A post that fails is the poster's error.
 function read(path, as)
   local f = io.open(path, "rb"); if not f then return nil end
   local s = f:read("*a"); f:close()
@@ -76,21 +64,26 @@ end
 function post(path, body, as)
   if as then body = bytes(as, body) end
   local aside = path .. ".writing"
-  local f = io.open(aside, "wb"); if not f then return end
-  f:write(body); f:close()
-  os.rename(aside, path)
+  local f, e = io.open(aside, "wb"); if not f then error("post: " .. e, 2) end
+  local wrote, e = f:write(body); f:close()
+  if wrote then wrote, e = os.rename(aside, path) end
+  if not wrote then os.remove(aside); error("post: " .. e, 2) end
 end
 function mend(path, make, as)
   if not read(path) then local t = make(); if t then post(path, t, as) end end
 end
 
--- a string as one shell word. A quote inside it would close ours, so it is doubled the way sh
--- wants: close, escape one, reopen.
+-- a string as one shell word: a quote inside it closes, escapes one, and reopens, as sh wants
 function quote(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 
--- work: a command run outside the town, without blocking it — or, with `join`, a line written to a
--- joined program. It comes back as a past `work` carrying `code`, `out`, `ms`, and whatever fields
--- were sent with it — match on those with `on`'s `by`. `where` is the line that asked, for timing.
+-- a body's copy, to add to: the caller's table may be said again
+local function copy(body)
+  local b = {}; for k, v in pairs(body or {}) do b[k] = v end; return b
+end
+
+-- work: run a command without blocking the town. A past `town/work` comes back with `code`,
+-- `out`, `ms` and what was sent, to match with `on`'s `by`. `where` is the line that asked, for
+-- timing.
 local acting   -- the clause react is running
 
 -- where work was asked: the line that called it, or, when `return work(…)` (a tail call) took that
@@ -107,60 +100,60 @@ local function asked()
 end
 
 function work(cmd, body)
-  local b = {}   -- a copy: the caller's table may be said again
-  for k, v in pairs(body or {}) do b[k] = v end
+  local b = copy(body)
   b.cmd = cmd
   b.where = asked()
-  return intent("work", b)
+  return intent("town/work", b)
 end
 
--- after: a wait that blocks nothing. Once `ms` have gone, a past `after` comes back carrying what
--- was sent with it — match on that with `on`'s `by`, as for `work`. A wait is the town's: it is
--- answered across a save, not across town itself starting again.
+-- after: a wait that blocks nothing. Once `ms` have gone, a past `town/after` comes back with what
+-- was sent. A wait is the town's: it is answered across a save, not across town starting again.
 function after(ms, body)
   if type(ms) ~= "number" or ms ~= ms or ms < 0 or ms == math.huge then   -- nan is not itself
     error("after: ms must be a number, 0 or more", 2)   -- the asker's line, the asker's error
   end
-  local b = {}   -- a copy: the caller's table may be said again
-  for k, v in pairs(body or {}) do b[k] = v end
+  local b = copy(body)
   b.ms = ms
-  return intent("after", b)
+  return intent("town/after", b)
 end
 
--- join: a program town keeps talking to, as `kind`, the way `watch` is a file it keeps reading.
--- As it starts, a bodiless past word of `kind` says so; then each line it says is a past word of
--- `kind`, and each future word of `kind` is a line written to it. When it ends, a past `join` comes
--- back carrying `code` and what was sent with it: to join it again is the resident's to say.
--- Joining a kind again ends the one before; the town opening again ends it too, and a resident
--- joins again as it opens.
+-- join: run a program as a resident at `kind`. The README's *at a kind*.
+--
+-- - owns: `kind`, and what is under it.
+-- - told: the facts there, then `now`, then each word wanted there; it says what is and what was.
+-- - paths: its kinds are from `kind`: `a/b` is `kind/a/b`, and none is `kind`.
+-- - speaks: `speaks`, or JSON.
+-- - ends: a past `town/join` carries its `code` and what was sent. Joining a kind again ends the
+--   one before, as a reopen does.
 function join(kind, argv, body)
-  local b = {}   -- a copy: the caller's table may be said again
-  for k, v in pairs(body or {}) do b[k] = v end
+  local b = copy(body)
   b.as, b.argv = kind, argv
-  return intent("join", b)
+  return intent("town/join", b)
 end
 
--- connect: a socket town keeps talking to, as `kind`, the way `join` is a program: `to` a path, or
--- a host:port. `speaks` in the body names the language it speaks, for a join too: what it says is
--- read in it, as parts, and a future word's body is written in it. It ends as a past `connect`.
+-- connect: reach a socket, `to` a path or a host:port, as `join` runs a program. As it ends, a
+-- past `town/connect` carries what was sent.
 function connect(kind, to, body)
-  local b = {}
-  for k, v in pairs(body or {}) do b[k] = v end
+  local b = copy(body)
   b.as, b.to = kind, to
-  return intent("connect", b)
+  return intent("town/connect", b)
 end
 
--- on: a clause — match a word by kind, tense, and what it goes by; run act(w). `by = "id"` is a
--- word whose body has that field; `by = { colour = "red" }` a word whose fields are these (`true`:
--- any value).
+-- on: a clause: match a word, then run act(w).
+--
+-- - kind: a pattern, as the README's *words* reads one: `nvim`, `nvim/`, `/nvim`.
+-- - tense: `past`, `present` or `future`, if named.
+-- - by: `by = "id"`, a word whose body has that field; `by = { colour = "red" }`, a word whose
+--   fields are these (`true`: any value).
 --   on("note", fn)  ·  on({ kind = "note", tense = "future", by = "id" }, fn)
+local hears = hears   -- town's rule, as it is now: a resident's own `hears` is not what `on` keeps
 function on(what, act)
   if type(what) == "string" then what = { kind = what } end
   local by = what.by
   return {
     kind = what.kind,
     match = function(w)
-      if what.kind and w.kind ~= what.kind then return false end
+      if what.kind and not hears(what.kind, w.kind) then return false end
       if what.tense and (w.tense or "present") ~= what.tense then return false end
       if by then
         local b = w.body
@@ -177,18 +170,20 @@ function on(what, act)
   }
 end
 
--- react: a resident from `on` clauses. Its `kinds` are the clauses' kinds, or every kind ("*") if
--- a clause names none, and `error` too if one names it; its `listen` runs the first matching
--- clause. Add `watch` (or other fields) to the returned table after, if needed.
+-- react: a resident from `on` clauses, and what else it is, `own` and `languages`, by name beside
+-- them. Its `kinds` are the clauses' kinds, or every kind ("/") if a clause names none, and
+-- `town/error` too if one names it; its `listen` runs the first matching clause.
 function react(list)
   local kinds, seen, all = {}, {}, false
   for _, c in ipairs(list) do
     if not c.kind then all = true
     elseif not seen[c.kind] then seen[c.kind] = true; kinds[#kinds + 1] = c.kind end
   end
-  if all then kinds = seen.error and { "*", "error" } or { "*" } end
+  if all then kinds = seen["town/error"] and { "/", "town/error" } or { "/" } end
   return {
     kinds = kinds,
+    own = list.own,
+    languages = list.languages,
     listen = function(w)
       for _, c in ipairs(list) do
         if c.match(w) then

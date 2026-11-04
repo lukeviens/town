@@ -1,5 +1,7 @@
-//! A body: what a word holds. Parts, or the JSON they were said in, read only when a part is
-//! asked for; written as JSON, it goes on as it came. Another language writes its parts anew.
+//! A body: what a word holds.
+//!
+//! - **parts**: read only when one is asked for; till then, the JSON it was said in.
+//! - **written**: as JSON, it goes on as it came; another language writes its parts anew.
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -34,7 +36,7 @@ impl Body {
         Body(Rc::new(Held { said: Some(bytes.into()), parts: OnceCell::new() }))
     }
 
-    /// its parts: JSON that is not JSON is nothing
+    /// its parts; bytes that are not JSON read as nothing
     pub fn parts(&self) -> &Parts {
         self.0.parts.get_or_init(|| {
             let bytes = self.0.said.as_ref().expect("a body is parts, or said");
@@ -42,7 +44,7 @@ impl Body {
         })
     }
 
-    /// the part named `name`
+    /// a part, by name
     pub fn part(&self, name: &str) -> Option<&Parts> {
         self.parts().get(name)
     }
@@ -68,12 +70,6 @@ impl Body {
             Some(bytes) => Cow::Borrowed(bytes),
             None => Cow::Owned(serde_json::to_vec(self.parts()).unwrap_or_else(|_| b"null".into())),
         }
-    }
-}
-
-impl Default for Body {
-    fn default() -> Body {
-        Body::none()
     }
 }
 
@@ -117,7 +113,7 @@ mod tests {
         assert!(Body::none().is_none() && !Body::of("").is_none());
         let unread = Body::said(&br#"{"n":1e400}"#[..]);
         assert!(!unread.is_none(), "what cannot be read is not nothing");
-        assert!(unread.parts().is_none() && !unread.is_none(), "it reads as nothing, read or not");
+        assert!(unread.parts().is_none(), "though it reads as nothing");
         assert_eq!(&*unread.json(), &br#"{"n":1e400}"#[..], "kept as said");
         assert!(Body::said(&b" null"[..]).is_none());
     }

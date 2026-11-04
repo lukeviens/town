@@ -1,9 +1,10 @@
-//! A language: how bytes are read as a body's parts, and its parts written as bytes. One grammar,
-//! run both ways, so a language is written once. A town's languages are said by its residents; JSON
-//! is the one town has before any resident speaks, for its log and its square.
+//! A language: one grammar, run both ways, reading bytes as a body's parts and writing parts as
+//! bytes. The README's *languages*.
 //!
-//! A grammar reads a stream: each piece reads, or does not, or needs more bytes than there are yet,
-//! so a connection waits for the rest of a word rather than taking half of one for none.
+//! - **said**: each is a resident's (`Resident::languages`); JSON is town's own, for its log and
+//!   its square.
+//! - **a stream**: each piece reads, or does not, or needs more bytes than there are yet, so a
+//!   resident waits for the rest of a word rather than taking half of one.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,8 +24,8 @@ pub enum Language {
 pub enum Read {
     /// parts, and how many bytes they took
     Got(Parts, usize),
-    /// bytes that are not of it
-    No,
+    /// bytes that are not of it, as far as it looked: none of it may begin before there
+    No(usize),
     /// bytes that may be, once more come: so many in all, at least
     More(usize),
 }
@@ -47,12 +48,12 @@ impl Language {
                 let (line, took) = match rest.iter().position(|&c| c == b'\n') {
                     Some(n) => (&rest[..n], blank + n + 1),
                     None if ended && !rest.is_empty() => (rest, bytes.len()),
-                    None if ended => return Read::No,
+                    None if ended => return Read::No(bytes.len()),
                     None => return Read::More(bytes.len() + 1),
                 };
                 match serde_json::from_slice(line) {
                     Ok(p) => Read::Got(p, took),
-                    Err(_) => Read::No,
+                    Err(_) => Read::No(took),
                 }
             }
             Language::Grammar(g) => g.read_from(bytes, ended, languages),
@@ -93,25 +94,54 @@ impl From<serde_json::Value> for Parts {
     }
 }
 
-/// A town's languages, by name: those said since it last opened, and JSON.
+/// A town's languages, by name: JSON, and those its residents are, each kept with where its
+/// resident is and the grammar it is made from, so each is made once.
 #[derive(Default)]
-pub struct Languages(RefCell<HashMap<String, Rc<Language>>>);
+pub struct Languages(RefCell<HashMap<String, Spoken>>);
+
+/// A language a resident is: where that resident is, the grammar it says, and what it makes.
+struct Spoken {
+    at: String,
+    grammar: Parts,
+    language: Rc<Language>,
+}
 
 impl Languages {
     /// a language said: a later one of the same name takes its place
     pub fn say(&self, name: &str, grammar: Grammar) {
-        self.0.borrow_mut().insert(name.to_string(), Rc::new(Language::Grammar(grammar)));
+        self.made("", name, &Parts::None, grammar);
     }
 
-    /// as the town opens again, its residents say their languages again
-    pub fn clear(&self) {
-        self.0.borrow_mut().clear();
+    /// the language `name`, made of `grammar` for the resident `at`, ready for its fact (`are`)
+    pub fn made(&self, at: &str, name: &str, grammar: &Parts, made: Grammar) {
+        let language = Rc::new(Language::Grammar(made));
+        let spoken = Spoken { at: at.to_string(), grammar: grammar.clone(), language };
+        self.0.borrow_mut().insert(name.to_string(), spoken);
+    }
+
+    /// The languages the resident `at` is now, each a grammar by its name, in place of those it
+    /// was: one made of the same grammar is kept, one not is made, and one that is no grammar is
+    /// not spoken.
+    pub fn are(&self, at: &str, all: &[(String, Parts)]) {
+        let mut languages = self.0.borrow_mut();
+        let mut was: HashMap<String, Spoken> = languages.extract_if(|_, s| s.at == at).collect();
+        for (name, grammar) in all {
+            let kept = was.remove(name).filter(|s| s.grammar == *grammar).map(|s| s.language);
+            let made = || Grammar::of(grammar).ok().map(|g| Rc::new(Language::Grammar(g)));
+            if let Some(language) = kept.or_else(made) {
+                let spoken = Spoken { at: at.to_string(), grammar: grammar.clone(), language };
+                languages.insert(name.clone(), spoken);
+            }
+        }
     }
 
     pub fn get(&self, name: &str) -> Result<Rc<Language>, String> {
         match name {
             "json" => Ok(Language::json()),
-            _ => self.0.borrow().get(name).cloned().ok_or(format!("no language is called {name}")),
+            _ => {
+                let spoken = self.0.borrow().get(name).map(|s| s.language.clone());
+                spoken.ok_or(format!("no language is called {name}"))
+            }
         }
     }
 
@@ -243,6 +273,8 @@ struct Reader<'a> {
     /// the languages being read, and where: one named again where it is already being read reads
     /// nothing, so a language that begins with itself ends
     reading: Vec<(*const Grammar, usize)>,
+    /// as far as any piece began to read
+    far: usize,
 }
 
 struct Writer<'a> {
@@ -254,33 +286,48 @@ struct Writer<'a> {
 }
 
 impl Grammar {
-    /// A grammar as parts: one of its pieces, by name, and what that piece takes. `{ upto = "\n"
-    /// }`, `{ part = { "key", g } }`, `{ seq = { g, … } }`, `{ many = { g, n } }`, `{ int = { size
-    /// = 2 } }`.
+    /// A grammar as parts: one of its pieces, by name, and what that piece takes:
+    /// `{ upto = "\n" }`, `{ part = { "key", g } }`, `{ seq = { g, … } }`, `{ many = { g, n } }`,
+    /// `{ int = { size = 2 } }`.
     pub fn of(p: &Parts) -> Result<Grammar, String> {
+        let g = Grammar::made(p)?;
+        g.counts(None)?;
+        Ok(g)
+    }
+
+    /// a grammar as parts, its counts not yet looked at
+    fn made(p: &Parts) -> Result<Grammar, String> {
         let one = match p {
             Parts::Map(m) if m.len() == 1 => &m[0],
             _ => return Err(format!("a grammar is one of {}", PIECES.join(", "))),
         };
         let (piece, g) = (one.0.as_str(), &one.1);
-        let bytes = || match g {
-            Parts::Text(t) => Ok(t.as_bytes().to_vec()),
-            Parts::Bytes(b) => Ok(b.clone()),
-            _ => Err(format!("`{piece}` takes bytes")),
+        // bytes, or a list of numbers, as JSON says them
+        let bytes = || {
+            match g {
+                Parts::Text(t) => Some(t.as_bytes().to_vec()),
+                Parts::Bytes(b) => Some(b.clone()),
+                Parts::List(l) => l.iter().map(|b| whole(b)?.try_into().ok()).collect(),
+                _ => None,
+            }
+            .ok_or(format!("`{piece}` takes bytes"))
         };
         let each = || match g {
             Parts::Map(m) if m.is_empty() => Ok(Vec::new()), // Lua's empty table
-            _ => {
-                g.list().ok_or(format!("`{piece}` takes a list"))?.iter().map(Grammar::of).collect()
-            }
+            _ => g
+                .list()
+                .ok_or(format!("`{piece}` takes a list"))?
+                .iter()
+                .map(Grammar::made)
+                .collect(),
         };
         // a grammar, or a grammar and a count
         let counted = || -> Result<(Box<Grammar>, Option<Count>), String> {
             match g.list() {
-                Some([g]) => Ok((Box::new(Grammar::of(g)?), None)),
-                Some([g, n]) => Ok((Box::new(Grammar::of(g)?), Some(Count::of(n)?))),
+                Some([g]) => Ok((Box::new(Grammar::made(g)?), None)),
+                Some([g, n]) => Ok((Box::new(Grammar::made(g)?), Some(Count::of(n)?))),
                 Some(_) => Err(format!("`{piece}` takes a grammar, and perhaps a count")),
-                None => Ok((Box::new(Grammar::of(g)?), None)),
+                None => Ok((Box::new(Grammar::made(g)?), None)),
             }
         };
         Ok(match piece {
@@ -295,7 +342,7 @@ impl Grammar {
             "choice" => Grammar::Choice(each()?),
             "many" => counted().map(|(g, n)| Grammar::Many(g, n))?,
             "map" => counted().map(|(g, n)| Grammar::Map(g, n))?,
-            "unless" => Grammar::Unless(Box::new(Grammar::of(g)?)),
+            "unless" => Grammar::Unless(Box::new(Grammar::made(g)?)),
             "int" => Grammar::Int(Int::of(g)?),
             "float" => {
                 let size = number(g, "size").unwrap_or(8.0) as usize;
@@ -307,16 +354,16 @@ impl Grammar {
             "text" => Grammar::Text(Count::of(g)?),
             "raw" => Grammar::Raw(Count::of(g)?),
             "be" => match g.list() {
-                Some([g]) => Grammar::Be(Box::new(Grammar::of(g)?), Parts::None),
-                Some([g, v]) => Grammar::Be(Box::new(Grammar::of(g)?), v.clone()),
+                Some([g]) => Grammar::Be(Box::new(Grammar::made(g)?), Parts::None),
+                Some([g, v]) => Grammar::Be(Box::new(Grammar::made(g)?), v.clone()),
                 _ => return Err("`be` takes a grammar and a part".into()),
             },
             "ref" => Grammar::Ref(g.text().ok_or("`ref` takes a language's name")?.into()),
-            "whole" => Grammar::Whole(Box::new(Grammar::of(g)?)),
+            "whole" => Grammar::Whole(Box::new(Grammar::made(g)?)),
             "part" => match g.list() {
                 Some([name, g]) => {
                     let name = name.text().ok_or("a part's name is text")?;
-                    Grammar::Part(name.to_string(), Box::new(Grammar::of(g)?))
+                    Grammar::Part(name.to_string(), Box::new(Grammar::made(g)?))
                 }
                 _ => return Err("`part` takes a name and a grammar".into()),
             },
@@ -325,21 +372,30 @@ impl Grammar {
     }
 
     /// The first of what `bytes` hold, as far as this grammar reads them.
-    pub fn read_from(&self, bytes: &[u8], ended: bool, languages: &Languages) -> Read {
+    fn read_from(&self, bytes: &[u8], ended: bool, languages: &Languages) -> Read {
         let (mut r, mut at) = (
-            Reader { b: bytes, ended, languages, deep: 0, known: Vec::new(), reading: Vec::new() },
+            Reader {
+                b: bytes,
+                ended,
+                languages,
+                deep: 0,
+                known: Vec::new(),
+                reading: Vec::new(),
+                far: 0,
+            },
             0,
         );
         match self.read(&mut r, &mut at) {
             R::Got(p) => Read::Got(p, at),
             R::More(n) if !ended => Read::More(n),
-            _ => Read::No,
+            _ => Read::No(r.far),
         }
     }
 
     /// What is read from `at`, which it moves past. A grammar that does not read leaves `at` for
     /// whoever tries next to put back.
     fn read(&self, r: &mut Reader, at: &mut usize) -> R {
+        r.far = r.far.max(*at);
         let rest = &r.b[*at..];
         // so many bytes, if there are so many; or more to wait for
         let (ended, start) = (r.ended, *at);
@@ -693,7 +749,15 @@ impl Count {
                 _ => Err("a count is a whole number, 0 or more".into()),
             },
             Parts::Text(name) => Ok(Count::Named(name.clone())),
-            _ => Ok(Count::Read(Box::new(Grammar::of(p)?))),
+            _ => Ok(Count::Read(Box::new(Grammar::made(p)?))),
+        }
+    }
+
+    /// the counts within one that is read, as `Grammar::counts` looks at them
+    fn counts(&self) -> Result<(), String> {
+        match self {
+            Count::Read(g) => g.counts(None),
+            _ => Ok(()),
         }
     }
 
@@ -836,6 +900,33 @@ fn length(p: &Parts) -> Option<usize> {
 }
 
 impl Grammar {
+    /// Whether each count that names a part names one read before it in the same seq, `before`
+    /// this piece: one that names none would write what cannot be read back.
+    fn counts(&self, before: Option<&[Grammar]>) -> Result<(), String> {
+        if let Some(n) = self.count_name() {
+            let part = |g: &Grammar| matches!(g, Grammar::Part(name, _) if name == n);
+            if !before.is_some_and(|b| b.iter().any(part)) {
+                return Err(format!("a count names `{n}`, and no part before it in its seq is"));
+            }
+        }
+        match self {
+            Grammar::Seq(items, _) => items.iter().enumerate().try_for_each(|(i, g)| match g {
+                Grammar::Part(_, g) => g.counts(Some(&items[..i])),
+                g => g.counts(Some(&items[..i])),
+            }),
+            Grammar::Choice(gs) => gs.iter().try_for_each(|g| g.counts(None)),
+            Grammar::Part(_, g)
+            | Grammar::Unless(g)
+            | Grammar::Be(g, _)
+            | Grammar::Whole(g)
+            | Grammar::Many(g, None)
+            | Grammar::Map(g, None) => g.counts(None),
+            Grammar::Many(g, Some(n)) | Grammar::Map(g, Some(n)) => g.counts(None).and(n.counts()),
+            Grammar::Text(n) | Grammar::Raw(n) => n.counts(),
+            _ => Ok(()),
+        }
+    }
+
     /// the part this piece's count names, if it names one
     fn count_name(&self) -> Option<&str> {
         match self {
@@ -1014,5 +1105,36 @@ mod tests {
         ] } }));
         assert_eq!(g.parts(b"ax,y"), Some(parts(json!([{ "a": "ax" }, { "a": "y" }]))));
         assert_eq!(g.bytes(&parts(json!([{ "a": "x" }]))), Some(b"x,".to_vec()));
+    }
+
+    // a grammar of bytes, said in JSON, which says bytes as a list of numbers, is the same grammar
+    #[test]
+    fn a_grammar_of_bytes_is_the_same_in_json() {
+        let lit = |b: &[u8]| Parts::map([("lit", Parts::Bytes(b.to_vec()))]);
+        let g = Parts::map([("seq", Parts::List(vec![lit(b"\xc0"), lit(b"\xff\x00")]))]);
+        let json: Parts = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_ne!(json, g, "JSON has no bytes");
+        assert_eq!(
+            Grammar::of(&json),
+            Ok(grammar(json!({ "seq": [{ "lit": [192] }, { "lit": [255, 0] }] })))
+        );
+        assert_eq!(Grammar::of(&json), Grammar::of(&g));
+        assert!(Grammar::of(&parts(json!({ "lit": [256] }))).is_err(), "a byte is 0 to 255");
+    }
+
+    // a count that names a part names one read before it, in its seq: one that names none would
+    // write what cannot be read back
+    #[test]
+    fn a_count_names_a_part_before_it() {
+        let of = |v: Value| Grammar::of(&parts(v));
+        let size = json!({ "part": ["size", { "int": {} }] });
+        assert!(of(json!({ "text": "n" })).unwrap_err().contains("`n`"));
+        assert!(of(json!({ "seq": [size, { "text": "sise" }] })).is_err(), "a name misspelled");
+        assert!(of(json!({ "seq": [{ "raw": "size" }, size] })).is_err(), "named after it");
+        assert!(
+            of(json!({ "seq": [size, { "choice": [{ "text": "size" }] }] })).is_err(),
+            "deeper"
+        );
+        assert!(of(json!({ "seq": [size, { "part": ["t", { "text": "size" }] }] })).is_ok());
     }
 }

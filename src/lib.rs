@@ -1,23 +1,22 @@
-//! town as a library — the same modules the binary runs, so tests, and any other crate, can reach
-//! the word, the present's fold, and the rest of town directly.
+//! town as a library: the modules the binary runs, for tests and any other crate.
 
 pub mod body;
-pub mod connection;
 pub mod language;
 pub mod log;
 pub mod lua;
 pub mod parts;
 pub mod paths;
+pub mod program;
 pub mod residents;
 pub mod square;
 pub mod town;
 pub mod unix;
+pub mod voice;
 pub mod word;
 pub mod work;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
-/// How a resident is written: the tenses, `on`/`react`, `work`, the file helpers. A town's own
-/// files are all loaded after it.
+/// How a resident is written, loaded before a town's own files.
 pub const RESIDENT: &str = include_str!("resident.lua");
