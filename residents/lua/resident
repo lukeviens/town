@@ -1,5 +1,6 @@
--- resident: how a resident is written, the same in every town, loaded before a town's own files.
--- The README's *in Lua*.
+-- vim: set ft=lua:
+-- resident: how a Lua resident is written, the same in every town, read into each file before it.
+-- Not named .lua, so `lua` does not take it for a resident. Its README is beside it.
 
 -- a word in each tense, so none types a tense by hand: a typo is no word
 function intent(kind, body) return { kind = kind, tense = "future",  body = body } end
@@ -89,7 +90,7 @@ local acting   -- the clause react is running
 -- where work was asked: the line that called it, or, when `return work(…)` (a tail call) took that
 -- line away, the clause that was running
 local function asked()
-  if not debug then return "?" end   -- absent under the test sandbox
+  if not debug then return "?" end   -- absent where Lua is made safe
   local i, line = debug.getinfo(3, "Sl"), nil
   if debug.getinfo(2, "t").istailcall and acting then
     i = debug.getinfo(acting, "S"); line = i.linedefined
@@ -117,7 +118,7 @@ function after(ms, body)
   return intent("town/after", b)
 end
 
--- join: run a program as a resident at `kind`. The README's *at a kind*.
+-- join: run a program as a resident at `kind`. Town's README's *a join*.
 --
 -- - owns: `kind`, and what is under it.
 -- - told: the facts there, then `now`, then each word wanted there; it says what is and what was.
@@ -170,15 +171,19 @@ function on(what, act)
   }
 end
 
--- react: a resident from `on` clauses, and what else it is, `own` and `languages`, by name beside
--- them. Its `kinds` are the clauses' kinds, or every kind ("/") if a clause names none, and
--- `town/error` too if one names it; its `listen` runs the first matching clause.
+-- react: a resident from `on` clauses, and what else it is, `kinds`, `own` and `languages`, by name
+-- beside them. Its `kinds` are the clauses' kinds and those it names besides; or every kind ("/")
+-- if a clause names none, and `town/error` too if one names it. Its `listen` runs the first
+-- matching clause.
 function react(list)
   local kinds, seen, all = {}, {}, false
-  for _, c in ipairs(list) do
-    if not c.kind then all = true
-    elseif not seen[c.kind] then seen[c.kind] = true; kinds[#kinds + 1] = c.kind end
+  local function hear(kind)
+    if not seen[kind] then seen[kind] = true; kinds[#kinds + 1] = kind end
   end
+  for _, c in ipairs(list) do
+    if not c.kind then all = true else hear(c.kind) end
+  end
+  for _, kind in ipairs(list.kinds or {}) do hear(kind) end   -- kinds it names besides
   if all then kinds = seen["town/error"] and { "/", "town/error" } or { "/" } end
   return {
     kinds = kinds,

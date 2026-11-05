@@ -1,5 +1,5 @@
-//! A program: a file town runs, written in anything, a resident at the root. The README's *as a
-//! program*.
+//! A program: a file town runs, written in anything, a resident at the root. The README's
+//! *a program*.
 //!
 //! - **what it is**: its first line says so; then words go both ways, in the language it speaks.
 //! - **where**: its own folder and process group, so all it starts ends with it.
@@ -25,9 +25,7 @@ pub(crate) async fn residing(town: Rc<Town>, who: Resident, path: PathBuf) {
     }
     // ended, it comes no more, nor those it spoke for: what they owned is held no longer
     let at = format!("{}/{}", crate::town::RESIDENTS, who.place());
-    town.hold_only(|kind| {
-        kind.strip_prefix(&at).is_none_or(|r| !r.is_empty() && !r.starts_with('/'))
-    });
+    town.hold_only(|kind| !crate::residents::under(kind, &at));
 }
 
 /// A run, from its first line, `voice::comes`, to its end, and how it ended. What it owns is its
@@ -47,20 +45,18 @@ async fn run(
         came = voice::comes(town, who, Voice::new(out), waits) => came,
         _ = child.wait() => Err(Unsaid::Gone),
     };
-    match came {
-        Ok(resident) => resident.live(town, &mut inp, Some(child.wait())).await,
-        Err(Unsaid::Refused(e)) => return town.error(who, None, e),
-        Err(Unsaid::Mute) => {
-            if let Err(how) = how(child.wait().await) {
-                town.error(who, None, format!("ended before it said what it is: {how}"));
-            }
-            return;
+    let ended = match came {
+        Ok(resident) => {
+            resident.live(town, &mut inp, Some(child.wait())).await;
+            "ended"
         }
+        Err(Unsaid::Refused(e)) => return town.error(who, None, e),
+        Err(Unsaid::Mute) => "ended before it said what it is",
         // it ends as it waits for its language
-        Err(Unsaid::Gone) => {}
-    }
+        Err(Unsaid::Gone) => "ended",
+    };
     if let Err(how) = how(child.wait().await) {
-        town.error(who, None, format!("ended: {how}"));
+        town.error(who, None, format!("{ended}: {how}"));
     }
 }
 
@@ -117,15 +113,10 @@ impl Group {
 pub(crate) struct Task(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Task {
-    /// waited for to its end
-    pub(crate) async fn ended(&mut self) {
-        (&mut self.0).await.ok();
-    }
-
     /// waited for to its end, but `LAST` at most: what it reads may be held open by one outside
     /// all that ended, as a program that left its group holds its stderr
     pub(crate) async fn last(&mut self) {
-        let _ = tokio::time::timeout(LAST, self.ended()).await;
+        let _ = tokio::time::timeout(LAST, &mut self.0).await;
     }
 }
 
@@ -149,7 +140,7 @@ impl Drop for Ends {
 }
 
 /// A program's stderr, each line a `town/error` from it, as far as `cut` keeps it: read aside, so
-/// all it says is heard, to the last once it and all it started end (`Task::ended`).
+/// all it says is heard, to the last once it and all it started end (`Task::last`).
 pub(crate) fn errors(
     town: &Rc<Town>,
     who: &Resident,
@@ -165,7 +156,7 @@ pub(crate) fn errors(
 }
 
 /// Whether a file runs: one, that may be executed.
-pub(crate) fn runs(path: &Path) -> bool {
+pub fn runs(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -240,7 +231,6 @@ mod tests {
     use crate::residents::open;
     use crate::testing::{an_error, guard, run, scratch, until, upto};
     use crate::word::{Tense, Word};
-    use mlua::Lua;
 
     // a program speaks for the residents under it: it says one is there, then words by it,
     // each checked as that one's
@@ -248,19 +238,19 @@ mod tests {
     fn a_program_speaks_for_those_under_it() {
         run(async {
             let dir = scratch();
-            let host = r#"echo '{"kinds":["ping"]}'
+            let speaker = r#"echo '{"kinds":["ping"]}'
                 echo '{"kind":"town/residents/sub","body":{"own":["subs"]}}'
                 echo '{"kind":"subs","tense":"past","body":"hi","by":"sub"}'
                 echo '{"kind":"subs","tense":"past","body":"not mine"}'
                 exec sleep 60"#;
-            let host = script(&dir, "host", host);
+            let speaker = script(&dir, "speaker", speaker);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[host]);
+            open(&town, &[speaker]);
             let hi = until(&mut words, |w| w.kind == "subs").await;
             assert_eq!(hi.body, Body::of("hi"), "by the one it speaks for");
             let refused = until(&mut words, |w| w.kind == "town/error").await;
-            assert_eq!(refused.body.value()["from"], "host", "not its own");
+            assert_eq!(refused.body.value()["from"], "speaker", "not its own");
             assert_eq!(refused.body.value()["heard"], "subs");
             town.reopen();
         });
@@ -276,7 +266,7 @@ mod tests {
             let typo = script(&dir, "typo", r#"echo '{"speaks":"wrds"}'; sleep 60 & exit 3"#);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[typo]);
+            open(&town, &[typo]);
             let from = |w: &Word| w.kind == "town/error" && w.body.value()["from"] == "typo";
             let waits = until(&mut words, from).await.body.value()["message"].clone();
             assert_eq!(waits, "no language is called wrds yet: it waits for one");
@@ -288,19 +278,22 @@ mod tests {
                 r#"{"speaks":"bare","languages":{"bare":GRAMMAR}}"#.replace("GRAMMAR", grammar);
             let first = format!("printf '%s\\n' '{first}'");
             let says = format!("{first}\necho hello; exec sleep 60");
-            open(&Lua::new(), &town, &[script(&dir, "bare", &says)]);
+            open(&town, &[script(&dir, "bare", &says)]);
             until(&mut words, |w| w.kind == "hello").await;
             // one whose language comes after it: what it says first is held for it
             let early = r#"echo '{"speaks":"late"}'; echo 123; echo second; exec sleep 60"#;
-            open(&Lua::new(), &town, &[script(&dir, "early", early)]);
+            open(&town, &[script(&dir, "early", early)]);
             let from = |w: &Word| w.kind == "town/error" && w.body.value()["from"] == "early";
             let waits = until(&mut words, from).await.body.value()["message"].clone();
             assert_eq!(waits, "no language is called late yet: it waits for one");
-            speaking(&town, &dir, "late", r#"seq{ { kind = upto("\n") } }"#);
-            let heard = upto(&mut words, |w| w.kind == "second");
-            let heard: Vec<_> = heard.await.into_iter().map(|w| w.kind).collect();
-            assert!(heard[0].starts_with("town/residents/"), "the language, first: {heard:?}");
-            assert_eq!(heard[1..], ["123", "second"], "JSON, but no word: {heard:?}");
+            speaking(&town, &dir, "late", r#"seq{ { kind = upto("\n") } }"#).await;
+            let heard = upto(&mut words, |w| w.kind == "second").await;
+            let at = |kind: &str| heard.iter().position(|w| w.kind == kind);
+            let spoken = heard.iter().position(|w| w.body.part("languages").is_some());
+            assert!(spoken.is_some() && spoken < at("123"), "the language, first: {heard:?}");
+            let said = heard.iter().map(|w| w.kind.as_str());
+            let said: Vec<_> = said.filter(|k| !k.starts_with("town/")).collect();
+            assert_eq!(said, ["123", "second"], "JSON, but no word: {heard:?}");
             town.reopen();
         });
     }
@@ -323,7 +316,7 @@ mod tests {
             let early = script(&dir, "early", "exit 4");
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[broken, ending, mute, early]);
+            open(&town, &[broken, ending, mute, early]);
             let mut runs: Vec<_> = town.tasks.borrow_mut().drain(..).map(|(_, t)| t).collect();
             // ending owns what it says it does while it runs, and gives it back as it ends
             let mine = Word::new("mine", Tense::Past, Body::none());
@@ -366,7 +359,7 @@ mod tests {
             let quiet = script(&dir, "quiet", quiet);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[quiet]);
+            open(&town, &[quiet]);
             until(&mut words, an_error("ready")).await;
             // long enough that its silence is heard first
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -377,7 +370,8 @@ mod tests {
     }
 
     // a program never hears its own errors, though it hears `town/error`: one that says aside all
-    // it hears would else say its error again without end
+    // it hears would else say its error again without end. It hears the present first, the paths
+    // among it
     #[test]
     fn a_program_does_not_hear_itself_fail() {
         run(async {
@@ -387,11 +381,17 @@ mod tests {
             let loud = script(&dir, "loud", loud);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[loud]);
+            open(&town, &[loud]);
             let failed = |w: &Word| w.kind == "town/error" && w.body.value()["from"] == "loud";
             let message = |w: Word| w.body.value()["message"].as_str().unwrap().to_string();
+            let paths = message(until(&mut words, failed).await);
+            let said = r#""kind":"town/residents","#;
+            assert!(
+                paths.contains(said),
+                "it fails first at the paths it was opened with: {paths}"
+            );
             let itself = message(until(&mut words, failed).await);
-            assert!(itself.contains("town/residents/"), "it fails first at what it is: {itself}");
+            assert!(itself.contains("town/residents/"), "then at what it is: {itself}");
             let now = message(until(&mut words, failed).await);
             assert!(now.contains(r#""kind":"""#), "then at what follows is now: {now}");
             town.talk(Word::new("pong", Tense::Past, Body::none()));
@@ -411,7 +411,7 @@ mod tests {
             let deaf = script(&dir, "deaf", deaf);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[deaf]);
+            open(&town, &[deaf]);
             until(&mut words, |w| w.kind == "up").await;
             let dropped = |w: &Word| w.body.value()["message"] == "is not reading: words dropped";
             let (mut said, mut pings) = (0, 0);
@@ -438,7 +438,7 @@ mod tests {
             let parent = script(&dir, "parent", parent);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, &[parent]);
+            open(&town, &[parent]);
             until(&mut words, |w| w.kind == "up").await;
             let child: unix::Pid =
                 std::fs::read_to_string(dir.join("child")).unwrap().trim().parse().unwrap();

@@ -13,6 +13,8 @@ use town::town::Town;
 use town::word::{Tense, Word};
 use town::{paths, program, residents, square, voice};
 
+use std::path::{Path, PathBuf};
+
 /// How town is called; said when it is called with nothing.
 const USAGE: &str = "\
 town <path>…                            open a town: residents, or folders of them, in order
@@ -22,19 +24,17 @@ town ask <word>                         say a word, and wait for its answer";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // `TOWN`: town itself, for its programs to call, `$TOWN talk`; one that names no file is
-    // replaced. And town's own programs, `town-watch` among them, beside it: first on its world's
-    // PATH, so it finds those it was built with, wherever it is
-    if let Ok(me) = std::env::current_exe() {
-        if !std::env::var_os("TOWN").is_some_and(|t| std::path::Path::new(&t).is_file()) {
+    // `TOWN`: town itself, for its programs to call, `$TOWN talk`; and `WATCH`, town's watch,
+    // `$WATCH <path>`: each the one given, if it names a file, or else found beside town, where it
+    // truly is, not a link to it on a PATH beside others. Town's programs are not put on its
+    // world's PATH: each is named by its whole path
+    if let Ok(me) = std::env::current_exe().and_then(|me| me.canonicalize()) {
+        let given = |var: &str| std::env::var_os(var).is_some_and(|v| Path::new(&v).is_file());
+        if !given("TOWN") {
             std::env::set_var("TOWN", &me);
         }
-        if let Some(beside) = me.parent() {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let paths = [beside.to_path_buf()].into_iter().chain(std::env::split_paths(&path));
-            if let Ok(path) = std::env::join_paths(paths) {
-                std::env::set_var("PATH", path);
-            }
+        if let Some(watch) = me.parent().and_then(watch).filter(|_| !given("WATCH")) {
+            std::env::set_var("WATCH", watch);
         }
     }
     match args.get(1).map(String::as_str) {
@@ -57,7 +57,7 @@ fn main() {
     }
     // a missing path, a misspelled verb among them, opens no town rather than half of one; each
     // is made whole as the town keeps it (`residents::keep`)
-    let paths: Vec<std::path::PathBuf> = args[1..].iter().map(std::path::PathBuf::from).collect();
+    let paths: Vec<PathBuf> = args[1..].iter().map(PathBuf::from).collect();
     if let Some(missing) = paths.iter().find(|p| !p.exists()) {
         eprintln!("town: no such resident: {}", missing.display());
         std::process::exit(2);
@@ -86,11 +86,17 @@ fn main() {
         town.compact();
         // programs stop with the town
         tokio::task::spawn_local(program::ending(town.clone()));
-        // opens the town, and each resident again as it is saved; the whole town in a new Lua each
-        // time: its residents are trusted, so all of Lua's own
-        residents::keep(|| unsafe { mlua::Lua::unsafe_new() }, &town, paths);
+        // opens the town, and each resident again as it is saved
+        residents::keep(&town, paths);
         square::run(square, town).await; // residents run alongside on the same runtime
     });
+}
+
+/// Town's watch, from the folder town is in: beside it, as cargo builds it, or in
+/// `../libexec/town`, as nix installs it under `bin/town`; the first that is a file.
+fn watch(beside: &Path) -> Option<PathBuf> {
+    let at = [beside.join("watch"), beside.join("../libexec/town/watch")];
+    at.into_iter().find(|w| w.is_file()).map(|w| residents::whole(&w))
 }
 
 /// `said`, or an exit saying why not and how a word is said
@@ -134,6 +140,22 @@ mod tests {
 
     fn said(args: &[&str]) -> Result<Word, String> {
         super::said(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    // town's watch is beside it, as cargo builds it, or in `../libexec/town`, as nix installs
+    // it, whole; with none, there is none
+    #[test]
+    fn the_watch_is_found_beside_town() {
+        let dir = std::env::temp_dir().join(format!("town-found-{}", std::process::id()));
+        let (bin, libexec) = (dir.join("bin"), dir.join("libexec/town"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&libexec).unwrap();
+        assert_eq!(watch(&bin), None, "none");
+        std::fs::write(libexec.join("watch"), "").unwrap();
+        assert_eq!(watch(&bin), Some(libexec.join("watch")), "as nix installs it");
+        std::fs::write(bin.join("watch"), "").unwrap();
+        assert_eq!(watch(&bin), Some(bin.join("watch")), "beside it first");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // a word said short: its tense, else present; its kind; its pairs as text, `=` and tabs and

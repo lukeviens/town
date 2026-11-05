@@ -1,4 +1,4 @@
--- reload: opens a resident again as it is saved. It joins `town-watch` on each path in
+-- reload: opens a resident again as it is saved. It joins town's `WATCH` on each path in
 -- `town/residents` but one inside another, which that one's watch holds, and asks `town/open` of
 -- each file a watch says changed, or is gone: town opens each once the opens of one save stop, if
 -- the file is a resident, or was one. What a watch says as it begins, before its `now`, is every
@@ -16,13 +16,14 @@ return {
   kinds = { "town/residents", "/reload" },
   listen = function(w)
     if w.kind == "town/residents" then
+      if not WATCH then error("town gives no WATCH, so there is no watch to join") end
       watching = {}
       local paths = w.body or {}
       for _, path in ipairs(paths) do
         local kind = "reload" .. path
         if not inside(path, paths) and watching[kind] == nil then
           watching[kind] = false
-          talk(join(kind, { "town-watch", path }))
+          talk(join(kind, { WATCH, path }))
         end
       end
       return

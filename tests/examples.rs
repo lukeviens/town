@@ -34,21 +34,30 @@ fn word(kind: &str, tense: Tense, body: Value) -> Word {
 #[test]
 fn the_examples_answer_as_they_say() {
     let dir = scratch();
-    // its world: town's own programs on its PATH, the watch among them, and where notes.lua keeps
-    // its file
-    let mut world = world_with(Path::new(env!("CARGO_BIN_EXE_town-watch")));
+    // its world: town's watch at `WATCH`, and where notes.lua keeps its file
+    let mut world = world_with(Path::new(env!("CARGO_BIN_EXE_watch")));
     world.insert("TMPDIR".into(), dir.as_os_str().into());
     run(async {
         let town = Town::in_world(dir.log(), world);
-        let lua = mlua::Lua::new();
-        town::lua::install(&lua, &town).unwrap();
         let mut words = town.words.listen();
-        // shout begins as the town opens
+        // what shout says, heard from the start
         let mut shouts = town.words.listen();
         // town's own residents, the languages they speak among them, then them
         let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
-        residents::open(&lua, &town, &[residents::own(), examples]);
-        until(&mut words, |w| w.kind == "notes").await; // notes.lua is up: its file, said
+        residents::open(&town, &[residents::own(), vec![examples]].concat());
+        // notes.lua is up: its file, said
+        until(&mut words, |w| w.kind == "notes").await;
+        // each Lua example is here before it is talked to: `lua` passes a file only what is said
+        // after it came
+        let here = |name: &str| {
+            let at = format!("/examples/{name}");
+            town.facts("town/residents/").keys().any(|kind| kind.ends_with(&at))
+        };
+        for name in ["clock.lua", "echo.lua", "hi.lua", "notes.lua"] {
+            while !here(name) {
+                until(&mut words, |_| true).await;
+            }
+        }
 
         // hello: a hi, the time it asked for, from clock, and a bye once its wait has gone
         let asked = Instant::now();
@@ -87,12 +96,12 @@ fn the_examples_answer_as_they_say() {
         let echoed = until(&mut words, |w| w.kind == "echoed").await;
         assert_eq!(echoed.body, Parts::from(json!({ "text": "hi" })));
 
-        // shout, a program: asked clock the time as it began, and shouts what it is told
-        let shouting = until(&mut shouts, |w| w.kind == "shouting").await.body.value();
-        assert_eq!(shouting["since"].as_str().unwrap().len(), "12:34:56".len());
+        // shout, a program: shouts what it is told, and asks clock the time as it first does
         town.talk(word("shout", Tense::Future, json!({ "text": "hi" })));
         let shouted = until(&mut words, |w| w.kind == "shouted").await;
         assert_eq!(shouted.body, Parts::from(json!({ "text": "HI" })));
+        let shouting = until(&mut shouts, |w| w.kind == "shouting").await.body.value();
+        assert_eq!(shouting["since"].as_str().unwrap().len(), "12:34:56".len());
 
         town.reopen();
     });

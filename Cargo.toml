@@ -11,6 +11,15 @@ repository = "https://github.com/lukeviens/town"
 name = "town"
 path = "src/main.rs"
 
+# town's own residents that are programs, built beside it
+[[bin]]
+name = "watch"
+path = "residents/watch.rs"
+
+[[bin]]
+name = "lua"
+path = "residents/lua/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = [
   "rt", "time", "net", "sync", "io-util", "macros", "process", "signal",

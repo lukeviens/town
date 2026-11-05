@@ -1,7 +1,7 @@
-//! `town-watch <path>`: a program that says what a path holds, and again as it changes. Town's own,
+//! `watch <path>`: a program that says what a path holds, and again as it changes. Town's own,
 //! a program like any other: town itself watches nothing.
 //!
-//! - **joined**: `join(kind, { "town-watch", path })`. It is told the facts town has there, then
+//! - **joined**: `join(kind, { WATCH, path })`. It is told the facts town has there, then
 //!   `now`.
 //! - **what it says**: a file as a fact at `""`, the kind itself; a folder as a fact of each file
 //!   in it, however deep, by its path from the folder, `a/b`.
@@ -39,11 +39,11 @@ enum Comes {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let [_, path] = &args[..] else {
-        eprintln!("usage: town-watch <path>");
+        eprintln!("usage: watch <path>");
         std::process::exit(2);
     };
     if let Err(e) = run(Path::new(path)) {
-        eprintln!("town-watch: {e}");
+        eprintln!("watch: {e}");
         std::process::exit(1);
     }
 }
@@ -357,36 +357,6 @@ mod tests {
         let kinds: Vec<String> =
             files(&dir.join("link"), Path::new(""), &BTreeMap::new()).0.into_keys().collect();
         assert_eq!(kinds, ["colors"]);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // a watch says each file, any bytes, as where it is and when it changed: what differs from
-    // what was said, and what was said that is gone as nothing; then that what follows is now
-    #[test]
-    fn a_watch_says_what_differs() {
-        let dir = std::env::temp_dir().join(format!("town-differs-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("a"), b"1").unwrap();
-        std::fs::write(dir.join("sub/b"), [0xff, 0xfe]).unwrap();
-        let file =
-            |name: &str| files(&dir, Path::new(name), &BTreeMap::new()).0.remove(name).unwrap();
-        let said: BTreeMap<String, Body> =
-            [("a", file("a")), ("old", Body::of("x"))].map(|(k, v)| (k.to_string(), v)).into();
-        let (tx, rx) = mpsc::channel();
-        tx.send(Comes::Gone).unwrap();
-        let mut out = Vec::new();
-        watch(&dir, said, rx, &mut out, &mut |_, _| {});
-        let words: Vec<(String, Body)> = String::from_utf8(out)
-            .unwrap()
-            .lines()
-            .map(|l| read(l).map(|w| (w.kind, w.body)).unwrap())
-            .collect();
-        let said = [("sub/b".into(), file("sub/b")), ("old".into(), Body::none())];
-        assert_eq!(
-            words,
-            [&said[..], &[("".into(), Body::none())]].concat(),
-            "then that it is now"
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

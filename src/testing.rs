@@ -118,15 +118,11 @@ pub fn an_error(of: &'static str) -> impl Fn(&Word) -> bool {
     }
 }
 
-/// The process's world, with the folder of `program`, one of town's own built beside it, first on
-/// its PATH, as `town` puts its own there.
+/// The process's world, with `watch`, town's own, at `WATCH`, as `town` gives its own there.
 pub fn world_with(
-    program: &Path,
+    watch: &Path,
 ) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
     let mut world: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
-    let beside = program.parent().map(Path::to_path_buf).unwrap_or_default();
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let paths = [beside].into_iter().chain(std::env::split_paths(&path));
-    world.insert("PATH".into(), std::env::join_paths(paths).unwrap_or_default());
+    world.insert("WATCH".into(), watch.as_os_str().into());
     world
 }

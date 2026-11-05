@@ -2,8 +2,8 @@
 //!
 //! - **read**: from its paths, in order.
 //! - **opened again**: at a future `town/open`, each saved alone, so it runs what is saved.
-//! - **each**: a Lua file is a Lua resident (`crate::lua`); any other file town may run is a
-//!   program (`program`).
+//! - **each**: a file that can run is a program (`program`), whatever it is written in; one that
+//!   cannot, as a file of Lua, is a resident's to speak for, as `lua` speaks for each Lua file.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
@@ -11,118 +11,119 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use mlua::Lua;
 use tokio::time::Instant;
 
 use crate::body::Body;
-use crate::lua::wire;
 use crate::parts::Parts;
-use crate::program::residing;
+use crate::program::{residing, runs};
 use crate::town::{Resident, Town, RESIDENTS};
 use crate::word::{Tense, Word};
 
-/// Town's own residents, the `residents` folder in its crate: its languages, and `reload`. Where
-/// nix installs town, it is given them in `share/town/residents` instead.
+/// What a town opens first: its own residents, the `residents` folder in its crate, its languages
+/// and `reload` among them; then `lua`, town's own program that speaks for each Lua file, as built
+/// beside the one running, or above it, as a test runs in `deps/`, if it is built. Where nix
+/// installs town, `share/town/residents` holds `lua` beside the rest, and is one path.
 #[cfg(any(test, feature = "testing"))]
-pub fn own() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("residents")
+pub fn own() -> Vec<PathBuf> {
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("residents");
+    let exe = std::env::current_exe().ok();
+    let beside = exe.as_deref().and_then(Path::parent);
+    let lua = beside.into_iter().flat_map(|at| [at.join("lua"), at.join("../lua")]);
+    let lua = lua.map(|l| whole(&l)).find(|l| crate::program::runs(l));
+    [folder].into_iter().chain(lua).collect()
 }
 
-/// Open a town: end what ran before, and bring its residents to life, as `files` reads them. What
-/// failed is said last, once every new resident listens, so one may hear it. Each file read, and
-/// the number of who it is, if it came.
-pub fn open(lua: &Lua, town: &Rc<Town>, paths: &[PathBuf]) -> Vec<(PathBuf, Option<u64>)> {
-    // end what ran for the town before, none left to notice a reopen itself
+/// Open a town at once, for a test: end what ran before, say its paths, whole, at
+/// `town/residents`, and run its programs. Each, and the number of who it is.
+#[cfg(any(test, feature = "testing"))]
+pub fn open(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+    let paths: Vec<PathBuf> = paths.iter().map(|p| whole(p)).collect();
     town.reopen();
-    let mut failed = Vec::new();
-    // how a resident is written, before any resident, so every one can be written with it
-    if let Err(e) = crate::lua::resident(lua) {
-        failed.push(("resident".to_string(), e.to_string()));
-    }
-    let ran = comes(lua, town, &files(paths), failed);
-    let came: Vec<PathBuf> = ran.iter().map(|(f, _)| f.clone()).collect();
-    holding(town, &came, |_| true);
+    say(town, &paths);
+    all(town, &paths)
+}
+
+/// The whole town comes: each program of its paths runs, and what was held is held only for those
+/// yet to come. Each, and the number of who it is.
+fn all(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+    let ran = comes(town, &files(paths, runs));
+    holding(town, &ran.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), |_| true);
     ran
 }
 
-/// What was held of what one opening `saved` is kept only for those of the files that `came` yet
-/// to ask for it: a program, and those it speaks for, until it says what it is; what a Lua file
-/// joined, until it has heard its greeting, as which it joins, once its task has run, a turn after
-/// this. The rest is let go, as all else that will come again has.
-fn holding(town: &Rc<Town>, came: &[PathBuf], saved: impl Fn(&str) -> bool) {
-    let program = |kind: &str| came.iter().any(|p| runnable(p) && under(kind, &fact(p)));
-    let lua: Vec<String> = came.iter().filter(|p| !runnable(p)).map(|p| fact(p)).collect();
-    let joined = move |kind: &str| lua.iter().any(|at| kind != at && under(kind, at));
-    town.hold_only(|kind| !saved(kind) || program(kind) || joined(kind));
-    let town = town.clone();
-    tokio::task::spawn_local(async move { town.hold_only(|kind| !joined(kind)) });
+/// The paths, whole, said at `town/residents`, so a resident that reads them, as `lua` does, may.
+fn say(town: &Town, paths: &[PathBuf]) {
+    let said: Vec<Parts> = paths.iter().map(|p| p.to_string_lossy().as_ref().into()).collect();
+    town.talk(Word::new(RESIDENTS, Tense::Present, Body::of(Parts::List(said))));
 }
 
-/// Each of `files` comes, in order: a program runs, a Lua file is read. What `failed` is said
-/// last. Each file, and the number of who it is.
-fn comes(
-    lua: &Lua,
-    town: &Rc<Town>,
-    files: &[PathBuf],
-    mut failed: Vec<(String, String)>,
-) -> Vec<(PathBuf, Option<u64>)> {
+/// What was held of what one opening `saved` is kept only for those of the programs that `came`
+/// yet to ask for it, until each says what it is, and for those one here speaks for, which it lets
+/// go itself. The rest is let go, as all else that will come again has.
+fn holding(town: &Town, came: &[PathBuf], saved: impl Fn(&str) -> bool) {
+    let program = |kind: &str| came.iter().any(|p| under(kind, &fact(p)));
+    town.hold_only(|kind| !saved(kind) || program(kind) || spoken(town, kind));
+}
+
+/// Whether the resident whose fact would be at `kind` is under one here, which speaks for it.
+fn spoken(town: &Town, kind: &str) -> bool {
+    let present = town.present.borrow();
+    let mut at = kind;
+    while let Some(up) = at.rfind('/').map(|i| &at[..i]) {
+        if up.len() <= RESIDENTS.len() {
+            return false;
+        }
+        if present.contains_key(up) {
+            return true;
+        }
+        at = up;
+    }
+    false
+}
+
+/// Each program of `files` runs, in order. Each, and the number of who it is.
+/// Each is by its file's name, at its whole path.
+fn comes(town: &Rc<Town>, files: &[PathBuf]) -> Vec<(PathBuf, u64)> {
     let mut ran = Vec::new();
     for path in files {
-        if runnable(path) {
-            let it = who(town, path);
-            ran.push((path.clone(), Some(it.id)));
-            let id = it.id;
-            town.runs(id, tokio::task::spawn_local(residing(town.clone(), it, path.clone())));
-        } else {
-            match wire(lua, town, path) {
-                Ok(id) => ran.push((path.clone(), Some(id))),
-                Err(e) => {
-                    ran.push((path.clone(), None));
-                    failed.push((named(path), e.to_string()));
-                }
-            }
-        }
-    }
-    for (from, message) in failed {
-        town.error(&town.who(&from, false), None, message);
+        let name = path.file_name().map_or("?".into(), |n| n.to_string_lossy().into_owned());
+        let placed = whole(path).to_string_lossy().trim_start_matches('/').to_string();
+        let it = Resident { placed: Some(placed), ..town.who(&name, false) };
+        ran.push((path.clone(), it.id));
+        town.runs(it.id, tokio::task::spawn_local(residing(town.clone(), it, path.clone())));
     }
     ran
 }
 
-/// Where the fact of the resident a file is would be.
+/// Where the fact of the resident a program is would be.
 fn fact(path: &Path) -> String {
     format!("{RESIDENTS}/{}", whole(path).to_string_lossy().trim_start_matches('/'))
 }
 
 /// Whether `kind` is `at`, or under it.
-fn under(kind: &str, at: &str) -> bool {
+pub(crate) fn under(kind: &str, at: &str) -> bool {
     kind.strip_prefix(at).is_some_and(|r| r.is_empty() || r.starts_with('/'))
 }
 
-/// Whether a file is a resident: a Lua file, or a program, wherever it is in the town's folders, so
-/// a build is kept outside them and its program linked in. Never a hidden file (`.git`, an editor's
-/// `.#lock`), nor an editor's backup (`name~`).
-fn resident(path: &Path) -> bool {
+/// Whether a file is one a walk finds: never a hidden file (`.git`, an editor's `.#lock`), nor an
+/// editor's backup (`name~`).
+fn shown(path: &Path) -> bool {
     let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    let named = !name.starts_with('.') && !name.ends_with('~');
-    named && (path.extension().is_some_and(|x| x == "lua") || runnable(path))
+    !name.starts_with('.') && !name.ends_with('~')
 }
 
-/// A program: a file town may run that is not Lua.
-fn runnable(path: &Path) -> bool {
-    path.extension().is_none_or(|x| x != "lua") && crate::program::runs(path)
-}
-
-/// The residents of a town, in the order they open: each path as given; a folder's as a `Walk`
-/// finds them, so a library beside them comes first; each folder read once, though two paths hold
-/// it. A file named twice runs once, where it first comes.
-fn files(paths: &[PathBuf]) -> Vec<PathBuf> {
+/// The files of a town that are `is`, in the order they open: each path as given; a folder's, as a
+/// `Walk` finds them, its own files before its folders, none hidden; each folder read once, though
+/// two paths hold it. A file named twice comes once, where it first comes. Town's are its
+/// programs (`program::runs`), wherever they are in its folders, so a build is kept outside them
+/// and its program linked in; a speaker's, those it runs.
+pub fn files(paths: &[PathBuf], is: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let (mut walk, mut files) = (Walk::default(), Vec::new());
     for p in paths {
         if p.is_dir() {
             walk.read(p, p, Path::new(""));
-            files.extend(walk.files.drain(..).map(|(f, ..)| f).filter(|f| resident(f)));
-        } else {
+            files.extend(walk.files.drain(..).map(|(f, ..)| f).filter(|f| shown(f) && is(f)));
+        } else if is(p) {
             files.push(p.clone());
         }
     }
@@ -131,16 +132,13 @@ fn files(paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Open a town, and keep it to open again: say its paths, whole, at `town/residents`, and open. Its
-/// `Opening` answers a future `town/open` (`work::begin`), asked by a resident that watches, as
-/// `reload` does. Each open is in a new Lua, `made`.
-pub fn keep(made: fn() -> Lua, town: &Rc<Town>, paths: Vec<PathBuf>) {
+/// Open a town, and keep it to open again: say its paths, whole, at `town/residents`, and open.
+/// Its `Opening` answers a future `town/open` of a program (`work::begin`), asked by a resident
+/// that watches, as `reload` does.
+pub fn keep(town: &Rc<Town>, paths: Vec<PathBuf>) {
     let paths: Vec<PathBuf> = paths.iter().map(|p| whole(p)).collect();
-    let said: Vec<Parts> = paths.iter().map(|p| p.to_string_lossy().as_ref().into()).collect();
-    town.talk(Word::new(RESIDENTS, Tense::Present, Body::of(Parts::List(said))));
+    say(town, &paths);
     let opening = Rc::new(Opening {
-        made,
-        lua: Default::default(),
         paths,
         ran: Default::default(),
         asked: Default::default(),
@@ -150,24 +148,22 @@ pub fn keep(made: fn() -> Lua, town: &Rc<Town>, paths: Vec<PathBuf>) {
     opening.open(town);
 }
 
-/// What a town keeps to open again: how its Lua is made, the Lua of this opening, its paths, each
-/// file it ran and the number of who it is, the files one save asks to open, and, while its opens
-/// come, when the last came and the most it waits. Town's own, so it outlives every opening.
+/// What a town keeps to open again: its paths, each program it ran and the number of who it is,
+/// the files one save touched, and, while its opens come, when the last came and the most it
+/// waits. Town's own, so it outlives every opening.
 pub struct Opening {
-    made: fn() -> Lua,
-    lua: RefCell<Option<Lua>>,
     paths: Vec<PathBuf>,
-    ran: RefCell<Vec<(PathBuf, Option<u64>)>>,
+    ran: RefCell<Vec<(PathBuf, u64)>>,
     asked: RefCell<Vec<PathBuf>>,
     settling: Cell<Option<(Instant, Instant)>>,
 }
 
 impl Opening {
-    /// A future `town/open`: one that `matters` opens what one save asks, once its opens stop.
-    /// They come a few ms apart, so it opens once none has come for `SETTLE`, or a second after
-    /// the first, if they never stop; every open meanwhile is of that save.
+    /// A future `town/open`: a save, of any file of the town. Its opens come a few ms apart, so it
+    /// is settled once none has come for `SETTLE`, or a second after the first, if they never stop;
+    /// every open meanwhile is of that save.
     pub(crate) fn ask(self: &Rc<Self>, town: &Rc<Town>, body: &Body) {
-        let Some(path) = matters(body, &self.ran.borrow()) else { return };
+        let Some(path) = matters(body, &self.paths, &self.ran.borrow()) else { return };
         let mut asked = self.asked.borrow_mut();
         if !asked.contains(&path) {
             asked.push(path);
@@ -179,7 +175,8 @@ impl Opening {
             return;
         }
         self.settling.set(Some((now, now + Duration::from_secs(1))));
-        let (me, town) = (self.clone(), town.clone());
+        // town's own, so it outlives a reopen; holding the town weakly, so a town done is freed
+        let (me, town) = (self.clone(), Rc::downgrade(town));
         tokio::task::spawn_local(async move {
             while let Some((last, most)) = me.settling.get() {
                 let at = (last + SETTLE).min(most);
@@ -190,54 +187,41 @@ impl Opening {
             }
             me.settling.set(None);
             let asked = me.asked.take();
-            me.again(&town, &asked);
+            if let Some(town) = town.upgrade() {
+                me.again(&town, &asked);
+            }
         });
     }
 
-    /// What one save asked opens again: each resident saved goes and comes again, alone; one
-    /// deleted goes. A library, which every resident after it is written with, opens the whole
-    /// town again; so does a Lua file it has not opened, one new or one that failed, which may be
-    /// one; and any save before the town has opened.
+    /// One save, settled: each program saved goes and comes again, alone, and one deleted goes;
+    /// then the save is said, a past `town/open` of every file it touched, so one that speaks for
+    /// files opens those it runs.
     fn again(&self, town: &Rc<Town>, asked: &[PathBuf]) {
-        let Some(lua) = self.lua.borrow().clone() else { return self.open(town) };
         let ran = self.ran.borrow().clone();
-        let who = |path: &PathBuf| ran.iter().find(|(f, _)| f == path).and_then(|(_, id)| *id);
-        // a library, as far as the town knows: a Lua file that left no fact, or that it never
-        // opened, as one new, or one that failed; and one that is one now opens it all, below
-        let of_lua = |path: &PathBuf| path.extension().is_some_and(|x| x == "lua");
-        let library = |path: &PathBuf| who(path).is_none_or(|id| town.place_of(id).is_none());
-        if asked.iter().any(|p| of_lua(p) && library(p)) {
-            return self.open(town);
-        }
         for path in asked {
-            if let Some(id) = who(path) {
-                town.leaves(&fact(path), id);
+            if let Some((_, id)) = ran.iter().find(|(f, _)| f == path) {
+                town.leaves(&fact(path), *id);
             }
         }
         // what is there: one deleted only goes
         let coming: Vec<PathBuf> =
-            asked.iter().filter(|p| resident(p) && p.exists()).cloned().collect();
-        let came = comes(&lua, town, &coming, Vec::new());
-        if came.iter().any(|(p, id)| of_lua(p) && id.is_some_and(|id| town.place_of(id).is_none()))
-        {
-            return self.open(town);
-        }
+            asked.iter().filter(|p| shown(p) && runs(p) && p.exists()).cloned().collect();
+        let came = comes(town, &coming);
         holding(town, &coming, |kind| asked.iter().any(|p| under(kind, &fact(p))));
         let mut ran = self.ran.borrow_mut();
         ran.retain(|(f, _)| !asked.contains(f));
         ran.extend(came);
+        drop(ran);
+        let paths = asked.iter().map(|p| p.to_string_lossy().as_ref().into()).collect();
+        let saved = Parts::map([("paths", Parts::List(paths))]);
+        town.talk(Word::new("town/open", Tense::Past, Body::of(saved)));
     }
 
-    /// The town opened in a new Lua, so a resident keeps nothing but what the present holds; the
-    /// old Lua let go with the residents it held. What it ran, kept.
+    /// The whole town opens again: all that ran ends; then each program runs, and hears the paths,
+    /// said before it, in its greeting. What it ran, kept.
     fn open(&self, town: &Rc<Town>) {
-        let lua = (self.made)();
-        if let Err(e) = crate::lua::install(&lua, town) {
-            town.error(&Resident::town(), None, format!("cannot make Lua: {e}"));
-        }
-        let ran = open(&lua, town, &self.paths);
-        *self.lua.borrow_mut() = Some(lua);
-        *self.ran.borrow_mut() = ran;
+        town.reopen();
+        *self.ran.borrow_mut() = all(town, &self.paths);
     }
 }
 
@@ -257,23 +241,16 @@ pub fn whole(path: &Path) -> PathBuf {
     whole
 }
 
-/// The file a `town/open` asks to open, whole, if it matters: it is a resident, or was one among
-/// those the town `ran`. One gone that it never ran, as one deleted while it was down, does not.
-fn matters(body: &Body, ran: &[(PathBuf, Option<u64>)]) -> Option<PathBuf> {
+/// The file a `town/open` asks to open, whole, if it matters: one of the town's, at or in one of
+/// its `paths` and nothing hidden on the way, as a walk finds them; or a program it `ran`.
+fn matters(body: &Body, paths: &[PathBuf], ran: &[(PathBuf, u64)]) -> Option<PathBuf> {
     let path = whole(Path::new(body.part("path").and_then(Parts::text)?));
-    let is = resident(&path) && path.exists();
-    (is || ran.iter().any(|(f, _)| *f == path)).then_some(path)
-}
-
-/// Who a file is, as it comes: by its name, at its whole path.
-pub(crate) fn who(town: &Town, path: &Path) -> Resident {
-    Resident { file: Some(whole(path)), ..town.who(&named(path), false) }
-}
-
-/// What a resident is called: its file's name, but for `.lua`.
-pub(crate) fn named(path: &Path) -> String {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or("?".into());
-    name.strip_suffix(".lua").map(String::from).unwrap_or(name)
+    let within = |at: &PathBuf| {
+        let inside = path.strip_prefix(at).ok();
+        inside.is_some_and(|i| i.components().all(|c| shown(Path::new(c.as_os_str()))))
+    };
+    let mine = shown(&path) && paths.iter().any(within);
+    (mine || ran.iter().any(|(f, _)| *f == path)).then_some(path)
 }
 
 /// How quiet a save must fall before what it saved opens again.
@@ -354,12 +331,18 @@ fn nearest(link: &Path) -> Option<PathBuf> {
 pub(crate) mod inside {
     use super::*;
     use crate::program::LAST;
-    use crate::testing::{an_error, quiet, run, scratch, until, upto, Scratch};
+    use crate::testing::{an_error, quiet, run, scratch, until, Scratch};
     use crate::town::Listening;
 
-    /// a word of `kind`, asked for
-    pub(crate) fn word(kind: &str) -> Word {
-        Word::new(kind, Tense::Future, Body::none())
+    /// `lua`, town's own program for its Lua files, as built: `cargo test` builds it.
+    pub(crate) fn lua() -> PathBuf {
+        let lua = own().into_iter().find(|p| p.is_file());
+        lua.expect("lua is built beside the tests: cargo build --bin lua")
+    }
+
+    /// Where the fact of a Lua file `lua` speaks for is: under `lua`'s place, by its whole path.
+    pub(crate) fn lua_fact(path: &Path) -> String {
+        format!("{}/{}", fact(&lua()), whole(path).to_string_lossy().trim_start_matches('/'))
     }
 
     /// End what runs for a town by its tasks alone, not as a reopen does, so what lets go as a
@@ -368,20 +351,36 @@ pub(crate) mod inside {
         town.tasks.borrow_mut().drain(..).for_each(|(_, h)| h.abort());
     }
 
-    /// a Lua resident, wired as a town opens it, and here until the town opens again
-    pub(crate) fn wired(town: &Rc<Town>, path: &Path) {
-        let lua = Lua::new();
-        crate::lua::install(&lua, town).unwrap();
-        crate::lua::resident(&lua).unwrap();
-        wire(&lua, town, path).unwrap();
+    /// `lua`, run once, as a town opens it, speaking for the Lua file at `path` beside those it
+    /// speaks for already, the paths at `town/residents`: here once the file has come. Named
+    /// again, it comes again, as it is now.
+    pub(crate) async fn wired(town: &Rc<Town>, path: &Path) {
+        let path = whole(path);
+        let mut words = town.words.listen();
+        let said = town.facts(RESIDENTS).remove(RESIDENTS);
+        let said = said.as_ref().and_then(|b| b.parts().list()).into_iter().flatten();
+        let mut paths: Vec<PathBuf> = said.filter_map(Parts::text).map(PathBuf::from).collect();
+        let runs = town.present.borrow().contains_key(&fact(&lua()));
+        if !paths.contains(&path) {
+            paths.push(path.clone());
+            say(town, &paths);
+        } else if runs {
+            town.talk(Word::new("town/open", Tense::Future, asked(&path)));
+        }
+        if !runs {
+            comes(town, &[lua()]);
+        }
+        let at = format!("/{}", path.to_string_lossy().trim_start_matches('/'));
+        let came = |w: &Word| w.kind.starts_with(RESIDENTS) && w.kind.ends_with(&at);
+        until(&mut words, |w| came(w) && !w.body.is_none()).await;
     }
 
     /// a resident that is the language `name`, its grammar in Lua: a file in `dir`, `wired`
-    pub(crate) fn speaking(town: &Rc<Town>, dir: &Path, name: &str, grammar: &str) {
+    pub(crate) async fn speaking(town: &Rc<Town>, dir: &Path, name: &str, grammar: &str) {
         let path = dir.join(format!("{name}.lua"));
         std::fs::write(&path, format!("return {{ languages = {{ {name} = {grammar} }} }}"))
             .unwrap();
-        wired(town, &path);
+        wired(town, &path).await;
     }
 
     /// a shell script in `dir`, a program town may run
@@ -393,64 +392,59 @@ pub(crate) mod inside {
         path
     }
 
-    // a folder's own files come before its folders, so a library beside them is there first; a
-    // resident, however deep; a linked folder read like any other, once, so a link back up ends; no
-    // hidden file or folder, no backup, nothing that is no resident
+    // a folder's own files come before its folders; a program, however deep, whatever it is
+    // written in; a linked folder read like any other, once, so a link back up ends; no hidden file
+    // or folder, no backup, nothing that cannot run, as a Lua file that cannot
     #[test]
     fn a_folder_reads_its_files_then_its_folders() {
         let dir = scratch();
-        let shared = dir.join("shared");
-        std::fs::create_dir_all(dir.join("town/apps")).unwrap();
+        let (top, shared) = (dir.join("town"), dir.join("shared"));
+        std::fs::create_dir_all(top.join("apps")).unwrap();
+        std::fs::create_dir_all(top.join(".git")).unwrap();
         std::fs::create_dir_all(&shared).unwrap();
-        for f in ["town/lib.lua", "town/apps/echo.lua", "town/notes.txt", "shared/linked.lua"] {
-            std::fs::write(dir.join(f), "").unwrap();
+        for f in ["lib.lua", "apps/echo.lua", "notes.txt"] {
+            std::fs::write(top.join(f), "").unwrap();
         }
-        script(&dir.join("town"), "run", "");
-        script(&dir.join("town"), "run~", ""); // an editor's backup
-        script(&dir.join("town/apps"), "deep", "");
-        std::os::unix::fs::symlink(&shared, dir.join("town/b-linked")).unwrap();
-        std::os::unix::fs::symlink(dir.join("town"), dir.join("town/apps/up")).unwrap();
-        std::fs::create_dir_all(dir.join("town/.git")).unwrap();
-        std::fs::write(dir.join("town/.git/hidden.lua"), "").unwrap();
-        std::fs::write(dir.join("town/.#lib.lua"), "").unwrap();
-        let names: Vec<String> = files(&[dir.join("town")])
-            .iter()
-            .map(|p| p.strip_prefix(dir.join("town")).unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["lib.lua", "run", "apps/deep", "apps/echo.lua", "b-linked/linked.lua"]);
-        // a file named by itself and in its folder runs once, where it first comes
-        let twice = files(&[dir.join("town/apps/echo.lua"), dir.join("town")]);
-        assert_eq!(twice.len(), 5);
-        assert!(twice[0].ends_with("apps/echo.lua"));
+        script(&top, "run", "");
+        script(&top, "run~", ""); // an editor's backup
+        script(&top, ".#run", ""); // an editor's lock
+        script(&top.join(".git"), "hidden", "");
+        script(&top.join("apps"), "deep", "");
+        script(&top.join("apps"), "runs.lua", ""); // a Lua file that runs itself
+        script(&shared, "linked", "");
+        std::os::unix::fs::symlink(&shared, top.join("b-linked")).unwrap();
+        std::os::unix::fs::symlink(&top, top.join("apps/up")).unwrap();
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            let names = files.iter().map(|p| p.strip_prefix(&top).unwrap());
+            names.map(|p| p.to_string_lossy().into_owned()).collect()
+        };
+        let all = ["run", "apps/deep", "apps/runs.lua", "b-linked/linked"];
+        assert_eq!(names(files(std::slice::from_ref(&top), runs)), all);
+        // a file named by itself and in its folder comes once, where it first comes
+        let twice = files(&[top.join("apps/deep"), top.clone()], runs);
+        assert_eq!(names(twice), ["apps/deep", "run", "apps/runs.lua", "b-linked/linked"]);
+        assert!(files(&[top.join("lib.lua")], runs).is_empty(), "a file named that cannot run");
+        assert!(files(&[top.join("none")], runs).is_empty(), "nor one not there");
     }
 
-    // an open matters to a resident, however deep, and only to one: not to an editor's backup or
-    // lock, or what is no resident; a resident gone, or no longer runnable, matters, as it was one;
-    // and an open names a path
+    // an open matters to any file of the town, however deep, gone or not: not to an editor's
+    // backup or lock, one in a hidden folder, or one outside the town; a program the town ran
+    // matters, wherever it is; and an open names a path
     #[test]
-    fn only_an_open_of_a_resident_matters() {
-        use std::os::unix::fs::PermissionsExt;
+    fn only_an_open_of_a_towns_file_matters() {
         let dir = scratch();
         let top = dir.join("town");
-        std::fs::create_dir_all(top.join("target")).unwrap();
         std::fs::create_dir_all(top.join("apps")).unwrap();
-        std::fs::write(top.join("apps/a.lua"), "").unwrap();
-        let shout = script(&top, "shout.py", "");
-        let ask = script(&top, "ask.sh", "");
-        let read: Vec<_> =
-            files(std::slice::from_ref(&top)).into_iter().map(|f| (f, None)).collect();
-        let changed = |path: &Path| matters(&asked(path), &read).is_some();
-        std::fs::write(top.join("Cargo.toml"), "").unwrap();
-        script(&top, "run~", "");
-        assert!(!changed(&top.join("Cargo.toml")) && !changed(&top.join("run~")), "no resident");
-        assert!(!changed(&top.join(".#lock")), "an editor's lock");
-        assert!(changed(&script(&top.join("target"), "built", "")), "a resident, however deep");
-        assert!(changed(&top.join("apps/a.lua")), "a resident saved");
-        std::fs::set_permissions(&ask, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(changed(&ask), "a program no longer runnable");
-        std::fs::remove_file(&shout).unwrap();
-        assert!(changed(&shout), "a resident taken away, whatever it is named");
-        assert!(matters(&Body::none(), &read).is_none(), "an open names a path");
+        let away = script(&dir, "away", "");
+        let (paths, ran) = (vec![whole(&top)], vec![(whole(&away), 0)]);
+        let changed = |path: &Path| matters(&asked(path), &paths, &ran).is_some();
+        assert!(changed(&top.join("apps/a.lua")), "a file of the town, however deep");
+        assert!(changed(&top.join("gone")), "gone or not");
+        assert!(!changed(&top.join("run~")) && !changed(&top.join(".#lock")), "a backup, a lock");
+        assert!(!changed(&top.join(".git/config")), "one in a hidden folder");
+        assert!(!changed(&dir.join("elsewhere")), "one outside the town");
+        assert!(changed(&away), "a program it ran, wherever it is");
+        assert!(matters(&Body::none(), &paths, &ran).is_none(), "an open names a path");
     }
 
     // a path is one place, read as a path is, so each part of it names something
@@ -461,24 +455,34 @@ pub(crate) mod inside {
         assert_eq!(whole(Path::new("b")), std::env::current_dir().unwrap().join("b"));
     }
 
+    // town's own: its folder, then `lua`, built, beside it; never the folder of what is built
+    #[test]
+    fn a_town_has_its_own() {
+        let own = own();
+        assert_eq!(own[0], Path::new(env!("CARGO_MANIFEST_DIR")).join("residents"));
+        assert_eq!(own.len(), 2, "lua, built: {own:?}");
+        assert!(own[1].ends_with("lua") && crate::program::runs(&own[1]), "{own:?}");
+        assert!(files(&own[..1], runs).is_empty(), "the folder holds no program: {own:?}");
+    }
+
     /// an open of `path`, as a resident asks it
     fn asked(path: &Path) -> Body {
         Body::of(Parts::map([("path", path.to_string_lossy().as_ref())]))
     }
 
-    /// a Lua file that says it opened, as it is read, so each opening is heard, however soon the
-    /// next; and a town kept from `top`, heard from before it opens
+    /// a Lua file that says it opened, as `lua` reads it, so each opening is heard, however soon
+    /// the next; and a town kept from `lua` and `top`, heard from before it opens
     async fn kept(dir: &Scratch, top: &Path) -> (Rc<Town>, Listening) {
         std::fs::create_dir_all(top).unwrap();
         std::fs::write(top.join("opens.lua"), r#"talk(event("opened"))"#).unwrap();
         let town = Town::with_log(dir.log());
         let mut words = town.words.listen();
-        keep(Lua::new, &town, vec![top.join(".")]);
+        keep(&town, vec![lua(), top.join(".")]);
         until(&mut words, |w| w.kind == "opened").await;
         (town, words)
     }
 
-    /// whether the town opens again within a while
+    /// whether the town's Lua opens again within a while
     async fn opens(words: &mut Listening) -> bool {
         let again = until(words, |w| w.kind == "opened");
         tokio::time::timeout(Duration::from_millis(300), again).await.is_ok()
@@ -493,75 +497,13 @@ pub(crate) mod inside {
             let (town, mut words) = kept(&dir, &top).await;
             assert!(!opens(&mut words).await, "opened once");
             let paths = town.facts(RESIDENTS).remove(RESIDENTS).unwrap();
-            assert_eq!(paths.value(), serde_json::json!([top]), "the paths, whole");
+            assert_eq!(paths.value(), serde_json::json!([lua(), top]), "the paths, whole");
             town.reopen();
         });
     }
 
-    // a Lua resident keeps nothing across an open but what the present holds: its globals are
-    // new each time
-    #[test]
-    fn a_lua_resident_keeps_no_globals_across_an_open() {
-        run(async {
-            let dir = scratch();
-            let top = dir.join("town");
-            std::fs::create_dir_all(&top).unwrap();
-            // a resident, which comes again alone, and a library, which opens the whole town
-            let count = top.join("count.lua");
-            let counts = r#"n = (n or 0) + 1; talk(event("counted", n))"#;
-            std::fs::write(
-                &count,
-                format!("{counts}; return {{ kinds = {{ \"x\" }}, listen = function() end }}"),
-            )
-            .unwrap();
-            let lib = top.join("a-lib.lua");
-            std::fs::write(&lib, r#"m = (m or 0) + 1; talk(event("libbed", m))"#).unwrap();
-            let town = Town::with_log(dir.log());
-            let mut words = town.words.listen();
-            keep(Lua::new, &town, vec![top]);
-            let counted = async |words: &mut Listening, kind: &'static str| {
-                until(words, move |w| w.kind == kind).await.body.value()
-            };
-            assert_eq!(counted(&mut words, "counted").await, 1);
-            town.talk(Word::new("town/open", Tense::Future, asked(&count)));
-            assert_eq!(counted(&mut words, "counted").await, 1, "a resident begins again");
-            town.talk(Word::new("town/open", Tense::Future, asked(&lib)));
-            assert_eq!(counted(&mut words, "libbed").await, 1, "and a library");
-            town.reopen();
-        });
-    }
-
-    // a file saved alone is given the libraries it came after the first time, and no later one
-    #[test]
-    fn a_resident_saved_alone_has_only_the_libraries_before_it() {
-        run(async {
-            let dir = scratch();
-            let top = dir.join("town");
-            std::fs::create_dir_all(&top).unwrap();
-            std::fs::write(top.join("a-early.lua"), "early = true").unwrap();
-            let middle = top.join("b-middle.lua");
-            let says = r#"talk(event("knows", tostring(early) .. " " .. tostring(late)))"#;
-            std::fs::write(
-                &middle,
-                format!("{says}; return {{ kinds = {{ \"x\" }}, listen = function() end }}"),
-            )
-            .unwrap();
-            std::fs::write(top.join("c-late.lua"), "late = true").unwrap();
-            let town = Town::with_log(dir.log());
-            let mut words = town.words.listen();
-            keep(Lua::new, &town, vec![top]);
-            let knows = async |words: &mut Listening| {
-                until(words, |w| w.kind == "knows").await.body.value()
-            };
-            assert_eq!(knows(&mut words).await, "true nil", "as it first came");
-            town.talk(Word::new("town/open", Tense::Future, asked(&middle)));
-            assert_eq!(knows(&mut words).await, "true nil", "and as it comes again alone");
-            town.reopen();
-        });
-    }
-
-    // a town done is freed: its Lua and its joins do not hold it, so once what runs for it ends
-    // and it is dropped, it is gone
+    // a town done is freed: its programs and their joins do not hold it, so once what runs for it
+    // ends and it is dropped, it is gone
     #[test]
     fn a_town_done_is_freed() {
         run(async {
@@ -573,9 +515,14 @@ pub(crate) mod inside {
             std::fs::write(top.join("joins.lua"), joins).unwrap();
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            keep(Lua::new, &town, vec![top]);
+            keep(&town, vec![lua(), top.clone()]);
+            let came = lua_fact(&top.join("joins.lua"));
+            until(&mut words, |w| w.kind == came && !w.body.is_none()).await;
             town.talk(Word::new("go", Tense::Past, Body::none()));
             until(&mut words, |w| w.kind == "mine").await;
+            if !town.joins.borrow().contains_key("cat") {
+                until(&mut words, |w| w.kind == format!("{came}/cat")).await;
+            }
             assert!(town.joins.borrow().contains_key("cat"), "it has a join");
             let gone = Rc::downgrade(&town);
             end(&town);
@@ -588,7 +535,8 @@ pub(crate) mod inside {
     }
 
     // what a program owned is held from the square as the town opens again, though it says what
-    // it is only once it runs; what a Lua file that is gone owned is let go as the town has opened
+    // it is only once it runs; what a Lua file that is gone owned is let go as `lua` says all it
+    // speaks for is said
     #[test]
     fn what_a_program_owned_is_held_as_the_town_opens_again() {
         run(async {
@@ -599,24 +547,33 @@ pub(crate) mod inside {
             std::fs::write(&gone, r#"return { own = { "gone" } }"#).unwrap();
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            let lua = Lua::new();
-            open(&lua, &town, &[themer.clone(), gone.clone()]);
+            open(&town, &[lua(), themer.clone(), gone.clone()]);
+            until(&mut words, |w| w.kind == lua_fact(&gone) && !w.body.is_none()).await;
             let came = |w: &Word| w.kind.ends_with("/themer") && !w.body.is_none();
             until(&mut words, came).await;
             std::fs::remove_file(&gone).unwrap();
-            open(&lua, &town, &[themer]);
+            open(&town, &[lua(), themer]);
             let owns = |own: &str| Resident { own: vec![own.into()], ..town.who("square", true) };
             assert!(town.come(&owns("theme")).is_err(), "held, before it says what it is");
-            assert!(town.come(&owns("gone")).is_ok(), "a Lua file gone: let go");
+            assert!(town.come(&owns("gone")).is_err(), "held, before lua says what it is");
+            // let go as lua says all it speaks for is said, once it has opened its files
+            let free = async {
+                while town.come(&owns("gone")).is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let free = tokio::time::timeout(Duration::from_secs(5), free).await;
+            assert!(free.is_ok(), "a Lua file gone: let go");
             until(&mut words, came).await;
             assert!(town.come(&owns("theme")).is_err(), "its own again");
             town.reopen();
         });
     }
 
-    // a future `town/open` of a resident opens it again, alone; of a library, which the residents
-    // after it are written with, the whole town; of what is no resident, nothing; of a resident
-    // deleted, it goes; and many opens of one save open once
+    // a future `town/open` of a resident opens it again, alone, and the save is said; of a Lua
+    // library, which the Lua files after it are written with, every Lua file, as `lua` opens them,
+    // and no program; of what is no resident, nothing; of a resident deleted, it goes; and many
+    // opens of one save open once
     #[test]
     fn an_open_of_a_resident_opens_it_again() {
         run(async {
@@ -630,11 +587,19 @@ pub(crate) mod inside {
             let new = r#"echo '{"own":["mine"]}'; echo '{"kind":"new"}'; exec cat"#;
             let new = script(&top, "new", new);
             open(&new);
+            let said = until(&mut words, |w| w.kind == "town/open" && w.tense == Tense::Past);
+            assert_eq!(
+                said.await.body.value()["paths"],
+                serde_json::json!([new]),
+                "the save, said"
+            );
             until(&mut words, |w| w.kind == "new").await;
             assert!(!opens(&mut words).await, "a new file comes, alone");
+            let id = |kind: &str| town.facts(kind).remove(kind).map(|b| b.value()["id"].clone());
+            let was = id(&fact(&new));
             (0..5).for_each(|_| open(&top.join("opens.lua")));
             assert!(opens(&mut words).await && !opens(&mut words).await, "once, for one save");
-            assert!(town.facts(&fact(&new)).contains_key(&fact(&new)), "come again with the rest");
+            assert!(was.is_some() && id(&fact(&new)) == was, "a program stays as it is");
             std::fs::remove_file(&new).unwrap();
             open(&new);
             until(&mut words, |w| w.kind == fact(&new) && w.body.is_none()).await;
@@ -658,24 +623,27 @@ pub(crate) mod inside {
             let (town, mut words) = kept(&dir, &top).await;
             let open = |path: &Path| town.talk(Word::new("town/open", Tense::Future, asked(path)));
             let id = |kind: &str| town.facts(kind).remove(kind).map(|b| b.value()["id"].clone());
-            let cat = format!("{}/cat", fact(&a));
+            let cat = format!("{}/cat", lua_fact(&a));
             let joined = |w: &Word| w.kind == cat && !w.body.is_none();
             if id(&cat).is_none() {
                 until(&mut words, joined).await;
             }
-            let (was, its, others) = (id(&fact(&a)), id(&cat), id(&fact(&b)));
+            let (was, its, others) = (id(&lua_fact(&a)), id(&cat), id(&lua_fact(&b)));
             assert!(town.joins.borrow().contains_key("cat"), "joined, under the one that asked");
 
             open(&a);
             until(&mut words, |w| w.kind == cat && w.body.is_none()).await;
             until(&mut words, joined).await;
-            assert!(id(&fact(&a)) != was && id(&cat) != its, "it, and its join, come again");
-            assert_eq!(id(&fact(&b)), others, "the others stay");
+            assert!(id(&lua_fact(&a)) != was && id(&cat) != its, "it, and its join, come again");
+            assert_eq!(id(&lua_fact(&b)), others, "the others stay");
             assert!(!opens(&mut words).await, "no more opens");
 
             std::fs::remove_file(&a).unwrap();
             open(&a);
-            until(&mut words, |w| w.kind == fact(&a) && w.body.is_none()).await;
+            until(&mut words, |w| w.kind == lua_fact(&a) && w.body.is_none()).await;
+            if id(&cat).is_some() {
+                until(&mut words, |w| w.kind == cat && w.body.is_none()).await;
+            }
             assert!(
                 id(&cat).is_none() && !town.joins.borrow().contains_key("cat"),
                 "its join, gone"
@@ -696,7 +664,7 @@ pub(crate) mod inside {
             let late = script(&dir, "late", late);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            open(&Lua::new(), &town, std::slice::from_ref(&late));
+            open(&town, std::slice::from_ref(&late));
             until(&mut words, |w| w.kind == fact(&late) && w.body.is_none()).await;
             let heard = until(&mut words, an_error("late"));
             assert!(tokio::time::timeout(LAST, heard).await.is_ok(), "its last line");
@@ -716,102 +684,49 @@ pub(crate) mod inside {
             let mute = script(&dir, "mute", "exec sleep 60");
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            let ran = open(&Lua::new(), &town, &[joins.clone(), mute.clone()]);
-            let cat = format!("{}/cat", fact(&joins));
+            let ran = open(&town, &[lua(), joins.clone(), mute.clone()]);
+            let cat = format!("{}/cat", lua_fact(&joins));
             until(&mut words, |w| w.kind == cat && !w.body.is_none()).await;
             for (path, id) in &ran {
-                town.leaves(&fact(path), id.unwrap());
+                town.leaves(&fact(path), *id);
             }
             let said = quiet(&mut words).await;
             let nothing =
                 |at: &str| said.iter().filter(|w| w.kind == at && w.body.is_none()).count();
-            assert_eq!((nothing(&fact(&joins)), nothing(&cat)), (1, 1), "once each");
+            let once = (nothing(&fact(&lua())), nothing(&lua_fact(&joins)), nothing(&cat));
+            assert_eq!(once, (1, 1, 1), "once each");
             assert_eq!(nothing(&fact(&mute)), 0, "none where none was");
             town.reopen();
         });
     }
 
-    // what a save is, a library or a resident, is read from the file saved: a library that failed
-    // to open, and a resident saved as a library, open the whole town, so the files after them are
-    // written with them
-    #[test]
-    fn a_save_that_is_a_library_opens_the_whole_town() {
-        run(async {
-            let dir = scratch();
-            let top = dir.join("town");
-            std::fs::create_dir_all(&top).unwrap();
-            let (lib, now) = (top.join("a-lib.lua"), top.join("c-now.lua"));
-            std::fs::write(&lib, "function greet(").unwrap();
-            std::fs::write(top.join("b.lua"), r#"talk(event("greeted", greet()))"#).unwrap();
-            std::fs::write(&now, r#"return { own = { "c" } }"#).unwrap();
-            std::fs::write(top.join("d.lua"), r#"talk(event("shouted", shout()))"#).unwrap();
-            let town = Town::with_log(dir.log());
-            let mut words = town.words.listen();
-            keep(Lua::new, &town, vec![top]);
-            let open = |path: &Path| town.talk(Word::new("town/open", Tense::Future, asked(path)));
-            let heard = async |words: &mut Listening, kind: &'static str| {
-                let said = until(words, move |w| w.kind == kind);
-                tokio::time::timeout(Duration::from_secs(2), said).await.is_ok()
-            };
-            std::fs::write(&lib, r#"function greet() return "hi" end"#).unwrap();
-            open(&lib);
-            assert!(heard(&mut words, "greeted").await, "a library that failed, mended");
-            std::fs::write(&now, r#"function shout() return "!" end"#).unwrap();
-            open(&now);
-            assert!(heard(&mut words, "shouted").await, "a resident, now a library");
-            town.reopen();
-        });
-    }
-
-    // a Lua resident deleted goes, and nothing fails: it is not opened, as it is not there; and
-    // one deleted that the town never ran is nothing to it
-    #[test]
-    fn a_lua_resident_deleted_goes_quietly() {
-        run(async {
-            let dir = scratch();
-            let top = dir.join("town");
-            std::fs::create_dir_all(&top).unwrap();
-            let gone = top.join("gone.lua");
-            std::fs::write(&gone, r#"return { own = { "gone" } }"#).unwrap();
-            let (town, mut words) = kept(&dir, &top).await;
-            let open = |path: &Path| town.talk(Word::new("town/open", Tense::Future, asked(path)));
-            std::fs::remove_file(&gone).unwrap();
-            open(&gone);
-            let said = upto(&mut words, |w| w.kind == fact(&gone) && w.body.is_none()).await;
-            let said = [said, quiet(&mut words).await].concat();
-            assert!(!said.iter().any(|w| w.kind == "town/error"), "nothing fails: {:?}", said);
-            open(&top.join("never.lua"));
-            assert!(!opens(&mut words).await, "one never ran: nothing");
-            town.reopen();
-        });
-    }
-
-    // what a program held, and what was under it, is held until it says what it is again, and
-    // let go then, so what it no longer asks for is not held from the square for good: saved, or
-    // as the whole town opens again
+    // what a program held is held until it says what it is again, and what was under it until it
+    // says all it speaks for is said, and let go then, so what it no longer asks for is not held
+    // from the square for good: saved, or as the whole town opens again
     #[test]
     fn what_a_program_no_longer_asks_for_is_let_go() {
         run(async {
             let dir = scratch();
             let top = dir.join("town");
             std::fs::create_dir_all(&top).unwrap();
-            let lib = top.join("a-lib.lua");
-            std::fs::write(&lib, "").unwrap();
             let was = r#"echo '{"own":["p"]}'
                 echo '{"kind":"town/join","tense":"future","body":{"as":"cat","argv":["cat"]}}'
                 echo '{"kind":"town/residents/sub","body":{"own":["subs"]}}'
                 exec sleep 60"#;
-            let is = r#"echo '{"own":["p"]}'; echo '{"kind":"up","tense":"past"}'; exec sleep 60"#;
+            let is = r#"echo '{"own":["p"]}'
+                echo '{"kind":"town/residents","tense":"past"}'
+                echo '{"kind":"up","tense":"past"}'
+                exec sleep 60"#;
             let p = script(&top, "p", was);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            keep(Lua::new, &town, vec![top.clone()]);
+            keep(&town, vec![top.clone()]);
             let open = |path: &Path| town.talk(Word::new("town/open", Tense::Future, asked(path)));
             let owns = |own: &str| Resident { own: vec![own.into()], ..town.who("square", true) };
             let (cat, sub) = (format!("{}/cat", fact(&p)), format!("{}/sub", fact(&p)));
-            for again in [&p, &lib] {
+            for whole in [false, true] {
                 script(&top, "p", was);
-                if again == &lib {
+                if whole {
                     open(&p);
                 }
                 let mut asked = [false, false];
@@ -820,44 +735,15 @@ pub(crate) mod inside {
                     asked = [asked[0] || w.kind == cat, asked[1] || w.kind == sub];
                 }
                 script(&top, "p", is);
-                open(again);
+                match whole {
+                    true => town.opening.borrow().clone().unwrap().open(&town),
+                    false => open(&p),
+                }
                 until(&mut words, |w| w.kind == "up").await;
                 assert!(town.come(&owns("p")).is_err(), "its own, again");
                 assert!(town.come(&owns("cat")).is_ok(), "its join, let go");
                 assert!(town.come(&owns("subs")).is_ok(), "one it spoke for, let go");
             }
-            town.reopen();
-        });
-    }
-
-    // what a Lua file joined is held from the square until it has heard its greeting, as which it
-    // joins again; and let go then, if it no longer does
-    #[test]
-    fn what_a_lua_file_joins_as_it_hears_is_held_until_it_hears() {
-        run(async {
-            let dir = scratch();
-            let top = dir.join("town");
-            std::fs::create_dir_all(&top).unwrap();
-            let joins = top.join("joins.lua");
-            let was = r#"return { kinds = { "town/residents" }, listen = function(w)
-                if w.kind == "town/residents" then return join("cat", { "cat" }) end
-              end }"#;
-            std::fs::write(&joins, was).unwrap();
-            let town = Town::with_log(dir.log());
-            let mut words = town.words.listen();
-            keep(Lua::new, &town, vec![top]);
-            let cat = format!("{}/cat", fact(&joins));
-            until(&mut words, |w| w.kind == cat && !w.body.is_none()).await;
-            let owns = |own: &str| Resident { own: vec![own.into()], ..town.who("square", true) };
-            let opening = town.opening.borrow().clone().unwrap();
-            // in the turn it comes again, before it hears
-            opening.again(&town, std::slice::from_ref(&joins));
-            assert!(town.come(&owns("cat")).is_err(), "held, before it hears");
-            until(&mut words, |w| w.kind == cat && !w.body.is_none()).await;
-            std::fs::write(&joins, r#"return { own = { "j" } }"#).unwrap();
-            opening.again(&town, std::slice::from_ref(&joins));
-            quiet(&mut words).await;
-            assert!(town.come(&owns("cat")).is_ok(), "let go, once it has heard");
             town.reopen();
         });
     }

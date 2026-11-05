@@ -383,7 +383,7 @@ mod tests {
             let mut lines = tokio::io::BufReader::new(ours).lines();
             let told_it = guard(told(&mut lines)).await.body.value();
             assert_eq!(told_it["message"], "no language is called kv yet: it waits for one");
-            speaking(&town, &dir, "kv", r#"upto("\n")"#);
+            speaking(&town, &dir, "kv", r#"upto("\n")"#).await;
             town.talk(Word::new("ping", Tense::Past, Body::none()));
             loop {
                 let w = guard(told(&mut lines)).await;
@@ -403,13 +403,13 @@ mod tests {
             let dir = scratch();
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
-            speaking(&town, &dir, "x", r#"seq{ { kind = upto("\n") } }"#);
+            speaking(&town, &dir, "x", r#"seq{ { kind = upto("\n") } }"#).await;
             let (mut ours, theirs) = UnixStream::pair().unwrap();
             tokio::task::spawn_local(at_square(theirs, town.clone()));
             ours.write_all(b"{\"speaks\":[\"x\",\"json\"]}\nfirst\n").await.unwrap();
             crate::testing::until(&mut words, |w| w.kind == "first").await;
             town.reopen();
-            speaking(&town, &dir, "x", r#"seq{ { kind = upto(";") } }"#);
+            speaking(&town, &dir, "x", r#"seq{ { kind = upto(";") } }"#).await;
             ours.write_all(b"second;\n").await.unwrap();
             let said = crate::testing::until(&mut words, |w| w.kind.starts_with("second")).await;
             assert_eq!(said.kind, "second", "read in the language as it is now");

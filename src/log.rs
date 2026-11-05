@@ -1,4 +1,4 @@
-//! The log: each fact, on disk, and all that touches it. The README's *words*, the log.
+//! The log: each fact, on disk, and all that touches it. The README's *town*, the log.
 //!
 //! - **as town starts**: folded into the present.
 //! - **as a fact is said**: appended, and the log compacted as it grows.

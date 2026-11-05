@@ -7,7 +7,7 @@
 //!   languages are read.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
@@ -28,14 +28,14 @@ pub struct Joined {
     pub(crate) _run: crate::program::Ends,
 }
 
-/// A resident: who says a word, a file of Lua, a program, a join, one at the square, or town
+/// A resident: who says a word, a program, a join, one at the square, one spoken for, or town
 /// itself, number 0. While it is here, this is its fact, at its `place`.
 ///
 /// - **what it says it is**: `kinds`, what it hears; `own`, what only it says while it is here;
 ///   `speaks`, its language, JSON if it names none, or `[says, hears]`; `languages`, those it is,
 ///   each a grammar by its name. Nothing else: a misspelled field would hear nothing, and say
 ///   nothing of why.
-/// - **what town gives it**: its number, its name, its file; `at`, the kind it is joined at, else
+/// - **what town gives it**: its number, its name, its place; `at`, the kind it is joined at, else
 ///   the root; `square`, whether it came there, so it may not say town's own; `by`, the one that
 ///   speaks for it, if one does.
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -57,17 +57,12 @@ pub struct Resident {
     pub at: Option<String>,
     #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
     pub square: bool,
-    #[serde(skip)]
-    pub file: Option<PathBuf>,
-    /// its place, if the resident that speaks for it said it is there: `<its place>/<name>`
+    /// its place, if it is given one: a file's whole path, or `<its speaker's place>/<name>`
     #[serde(skip)]
     pub placed: Option<String>,
     /// the number of the resident that speaks for it, if one does
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub by: Option<u64>,
-    /// a file of Lua: it speaks for none, as its words have no `by`
-    #[serde(skip)]
-    pub lua: bool,
 }
 
 /// Where town's residents are: the fact, the paths town is opened with; under it, each resident
@@ -78,7 +73,7 @@ pub const RESIDENTS: &str = "town/residents";
 
 /// Whether a fact of `kind` is kept in the log: all but `RESIDENTS` and what is under it.
 fn logged(kind: &str) -> bool {
-    kind.strip_prefix(RESIDENTS).is_none_or(|rest| !rest.is_empty() && !rest.starts_with('/'))
+    !crate::residents::under(kind, RESIDENTS)
 }
 
 /// Whether `kind` is a resident's, under `RESIDENTS`: what the owners are read from.
@@ -199,6 +194,13 @@ impl Listening {
     }
 }
 
+impl Queue {
+    /// whether it is the queue of the resident numbered `id`
+    fn of(&self, id: u64) -> bool {
+        self.most.as_ref().is_some_and(|(_, who)| who.id == id)
+    }
+}
+
 impl Words {
     /// listen from now: every word said after, in order. Only tests listen so; public for those in
     /// `tests/`.
@@ -224,16 +226,30 @@ impl Words {
     /// before it says what it is; quietly, until it is told (`Listening::told`): if more come than
     /// may wait, what waits stays, and what comes after is dropped
     pub fn coming(&self, most: usize, who: &Resident) -> Listening {
-        // who it is, to say it falls behind: no more of it than that
-        let who = Resident {
-            id: who.id,
-            name: who.name.clone(),
-            square: who.square,
-            ..Resident::default()
-        };
-        let listening = self.hear(|_, _| true, Some((most, who)));
+        // who it is, and where, to say it falls behind
+        let listening = self.hear(|_, _| true, Some((most, who.clone())));
         listening.state.told.set(false);
         listening
+    }
+
+    /// what the resident numbered `id` hears now and did not, as it hears more for those it speaks
+    /// for (`Town::speak`): to its own queue, after what waits, before any word after, told as any
+    /// word is. The present, so all of it, past what may wait. Not yet told, it waits like any
+    /// fact, and goes as it is greeted with the present, which holds it (`Listening::told`)
+    fn greet(&self, id: u64, words: Vec<Word>) {
+        let queues = self.0.borrow();
+        for q in queues.iter().filter(|q| q.of(id)) {
+            for w in &words {
+                if q.to.send(w.clone()).is_ok() {
+                    q.state.waiting.set(q.state.waiting.get() + 1);
+                }
+            }
+        }
+    }
+
+    /// whether the resident numbered `id` has a queue of its own
+    fn holds(&self, id: u64) -> bool {
+        self.0.borrow().iter().any(|q| q.of(id) && !q.to.is_closed())
     }
 
     /// a word, to each who hears it; one gone is let go, and one who falls behind is said, once, as
@@ -295,17 +311,12 @@ impl Drop for Here {
     }
 }
 
-/// The number of the resident that speaks for the one whose fact this is, if one does.
-fn spoken_by(body: &Body) -> Option<u64> {
-    match body.part("by") {
+/// A number a resident's fact says: its `id`, or `by`, the one that speaks for it.
+fn number(body: &Body, part: &str) -> Option<u64> {
+    match body.part(part) {
         Some(Parts::Number(n)) => n.parse().ok(),
         _ => None,
     }
-}
-
-/// Whether a resident's fact says it is the language `name`.
-fn speaks(body: &Body, name: &str) -> bool {
-    body.part("languages").and_then(|l| l.get(name)).is_some()
 }
 
 /// The languages a resident's fact says it is, each a grammar by its name.
@@ -316,12 +327,21 @@ fn spoken(body: &Body) -> &[(String, Parts)] {
     }
 }
 
+/// The kinds a resident's fact says it hears.
+fn kinds(body: &Body) -> impl Iterator<Item = &str> {
+    body.part("kinds").and_then(Parts::list).into_iter().flatten().filter_map(Parts::text)
+}
+
 /// The number of the resident a fact under `RESIDENTS` says.
 fn id(body: &Body) -> Option<u64> {
-    match body.part("id") {
-        Some(Parts::Number(n)) => n.parse().ok(),
-        _ => None,
-    }
+    number(body, "id")
+}
+
+/// Who owns what, as a resident's fact says.
+fn owners(body: &Body) -> impl Iterator<Item = Owner> + '_ {
+    let (id, square) = (id(body).unwrap_or(0), body.part("square").is_some());
+    let own = body.part("own").and_then(Parts::list).into_iter().flatten();
+    own.filter_map(Parts::text).map(move |kind| Owner { kind: kind.into(), id, square })
 }
 
 /// One who owns a kind, as the present says: the kind as it names it, the number of who owns it,
@@ -367,9 +387,16 @@ pub struct Town {
     /// who was told another's `town/error` last, by number: what it says now may answer it
     /// (`failed`)
     answering: RefCell<HashSet<u64>>,
-    /// what the residents of the last opening owned, by the kind of their fact: held against one at
-    /// the square until one comes there again, or the one it is under (`come`), or none will
-    /// (`hold_only`), as a program says what it is only once it runs
+    /// who speaks for whom, by number, kept as numbers are, never given again: so it is known still
+    /// once one's fact is gone, as an error it said as it went is told
+    speakers: RefCell<std::collections::HashMap<u64, u64>>,
+    /// what each speaker hears for those it speaks for, however deep, by its number: their kinds,
+    /// read from their facts as each changes (`own`)
+    speaking: RefCell<HashMap<u64, BTreeSet<String>>>,
+    /// what residents gone to come again owned, by the kind of their fact: held against one at the
+    /// square until one comes there again; or, for one under a speaker, until its speaker says all
+    /// it speaks for is said (`all_said`), or ends; or none will (`hold_only`), as a program says
+    /// what it is only once it runs
     held: RefCell<Vec<(String, Owner)>>,
 }
 
@@ -387,17 +414,13 @@ impl Resident {
         Resident { name: "town".into(), ..Resident::default() }
     }
 
-    /// Where its fact is, under `RESIDENTS`: one at the square by its number, `square/<id>`; a
-    /// join by its kind; a file by its whole path, its leading `/` the separator; any other by its
-    /// number.
+    /// Where its fact is, under `RESIDENTS`: where it is placed; one at the square by its number,
+    /// `square/<id>`; a join by its kind; any other by its number.
     pub fn place(&self) -> String {
-        if let Some(placed) = &self.placed {
-            return placed.clone();
-        }
-        match (&self.at, &self.file) {
+        match (&self.placed, &self.at) {
+            (Some(placed), _) => placed.clone(),
             _ if self.square => format!("square/{}", self.id),
-            (Some(at), _) => at.clone(),
-            (None, Some(file)) => file.to_string_lossy().trim_start_matches('/').into(),
+            (None, Some(at)) => at.clone(),
             (None, None) => self.id.to_string(),
         }
     }
@@ -430,6 +453,8 @@ impl Town {
             opening: Default::default(),
             world,
             answering: Default::default(),
+            speakers: Default::default(),
+            speaking: Default::default(),
             held: Default::default(),
         })
     }
@@ -444,20 +469,22 @@ impl Town {
     /// at and is nothing. It owns all it says, or none (`may_own`).
     pub fn come(self: &Rc<Self>, who: &Resident) -> Result<Here, String> {
         self.may_come(who, None)?;
-        // come again, what was held for it and under it goes, as what it asks for again it asks
-        // from here; but a Lua file's, which asks as it hears its greeting (`residents::holding`)
+        if let Some(by) = who.by {
+            self.speakers.borrow_mut().insert(who.id, by);
+        }
+        // come again, what was held for it goes; not what is under it, which it lets go as it says
+        // all it speaks for is said (`all_said`), or ends; nor what is held for one spoken for,
+        // which goes as its fact comes (`own`)
         let kind = format!("{RESIDENTS}/{}", who.place());
-        if !who.lua {
-            let within = |at: &str| at.strip_prefix(&kind).is_some_and(|r| r.starts_with('/'));
-            self.held.borrow_mut().retain(|(at, _)| *at != kind && !within(at));
+        if who.by.is_none() {
+            self.held.borrow_mut().retain(|(at, _)| *at != kind);
         }
         if who.nothing() {
             return Ok(Here { town: Rc::downgrade(self), kind: None, id: who.id });
         }
         let body = Body::of(serde_json::to_value(who).map(Parts::from).map_err(|e| e.to_string())?);
         // the languages it is, as its fact says them: none json, town's own, nor another's; each a
-        // grammar, made once, here
-        let mut made = Vec::new();
+        // grammar, made as its fact is said (`own`)
         for (name, grammar) in spoken(&body) {
             if name == "json" {
                 return Err("json is town's own".into());
@@ -465,13 +492,11 @@ impl Town {
             if who.square {
                 return Err(format!("`{name}`: what came to the square is no language"));
             }
-            if self.residents().values().any(|r| id(r) != Some(who.id) && speaks(r, name)) {
+            let is = |r: &Body| r.part("languages").and_then(|l| l.get(name)).is_some();
+            if self.residents().values().any(|r| id(r) != Some(who.id) && is(r)) {
                 return Err(format!("another is `{name}`"));
             }
-            made.push(crate::language::Grammar::of(grammar).map_err(|e| format!("{name}: {e}"))?);
-        }
-        for ((name, grammar), made) in spoken(&body).iter().zip(made) {
-            self.languages.made(&kind, name, grammar, made);
+            crate::language::Grammar::of(grammar).map_err(|e| format!("{name}: {e}"))?;
         }
         self.talk(Word::new(kind.as_str(), Tense::Present, body));
         Ok(Here { town: Rc::downgrade(self), kind: Some(kind), id: who.id })
@@ -533,26 +558,86 @@ impl Town {
         self.facts(&format!("{RESIDENTS}/"))
     }
 
-    /// Who owns what, as the present says, read again as the resident's fact at `kind` changes,
-    /// before any hears it; and the languages it is, if it is or `was` any, so a language is spoken
-    /// from the moment it is said, and only those of the one that changed are made again.
-    fn own(&self, kind: &str, was: bool) {
-        let mut owners = Vec::new();
-        for body in self.residents().into_values() {
-            let Some(id) = id(&body) else { continue };
-            let square = body.part("square").is_some();
-            let own = body.part("own").and_then(Parts::list).into_iter().flatten();
-            let owner = |kind: &str| Owner { kind: kind.into(), id, square };
-            owners.extend(own.filter_map(Parts::text).map(owner));
+    /// Whether what the one numbered `by` said is the one numbered `me`'s: said by it, or by one it
+    /// speaks for, however deep.
+    pub(crate) fn is_its(&self, me: u64, by: u64) -> bool {
+        self.speakers_of(by).contains(&me)
+    }
+
+    /// The one numbered `who`, then the one that speaks for it, and so on up: as deep as there are
+    /// speakers, and no deeper, though none speaks for itself.
+    fn speakers_of(&self, who: u64) -> Vec<u64> {
+        let speakers = self.speakers.borrow();
+        let mut chain = vec![who];
+        while let Some(&up) = chain.last().and_then(|at| speakers.get(at)) {
+            if chain.len() > speakers.len() {
+                break;
+            }
+            chain.push(up);
         }
-        *self.owners.borrow_mut() = owners;
+        chain
+    }
+
+    /// Whether the one numbered `me` hears a word of `kind` for one it speaks for.
+    pub(crate) fn hears_for(&self, me: u64, kind: &str) -> bool {
+        self.speaking.borrow().get(&me).is_some_and(|all| all.iter().any(|k| hears(k, kind)))
+    }
+
+    /// The kinds the one numbered `me` hears for those it speaks for.
+    pub(crate) fn kinds_for(&self, me: u64) -> Vec<String> {
+        self.speaking.borrow().get(&me).into_iter().flatten().cloned().collect()
+    }
+
+    /// Who owns what, as the present says, read again as the resident's fact at `kind` changes,
+    /// before any hears it; what each speaker hears for others (`speaking`); and the languages it
+    /// is, so a language is spoken from the moment it is said, and only those of the one that
+    /// changed are made again.
+    fn own(&self, kind: &str) {
+        let residents = self.residents();
+        let owned = residents.values().filter(|b| id(b).is_some());
+        *self.owners.borrow_mut() = owned.flat_map(owners).collect();
+        self.speak(&residents);
         // come again, what was held there is its own, or another's
         if self.present.borrow().contains_key(kind) {
             self.held.borrow_mut().retain(|(at, _)| at != kind);
         }
         let is = self.present.borrow().get(kind).map(|b| spoken(b).to_vec()).unwrap_or_default();
-        if was || !is.is_empty() {
-            self.languages.are(kind, &is);
+        self.languages.are(kind, &is);
+    }
+
+    /// What each speaker hears for those it speaks for, read again from `residents`: their kinds,
+    /// and those of the ones they speak for, however deep; not what is wanted of them. One that
+    /// hears more is told, at once, before any word after, the present facts it hears now and did
+    /// not; one that hears less is told nothing.
+    fn speak(&self, residents: &BTreeMap<String, Body>) {
+        let mut speaking = HashMap::<u64, BTreeSet<String>>::new();
+        for body in residents.values() {
+            let kinds: Vec<String> = kinds(body).map(String::from).collect();
+            let by = number(body, "by").filter(|_| !kinds.is_empty());
+            for at in by.map(|by| self.speakers_of(by)).into_iter().flatten() {
+                speaking.entry(at).or_default().extend(kinds.iter().cloned());
+            }
+        }
+        let was = self.speaking.replace(speaking);
+        for (&by, now) in self.speaking.borrow().iter() {
+            let before = was.get(&by);
+            let new: Vec<&String> =
+                now.iter().filter(|k| before.is_none_or(|b| !b.contains(*k))).collect();
+            if new.is_empty() {
+                continue;
+            }
+            // what it heard already, its own kinds or others', it is not told again
+            let mine = residents.values().find(|b| id(b) == Some(by));
+            let own: Vec<&str> = mine.into_iter().flat_map(kinds).collect();
+            let old = before.into_iter().flatten().map(String::as_str);
+            let heard: Vec<&str> = own.into_iter().chain(old).collect();
+            let mut facts = BTreeMap::new();
+            for kind in new {
+                facts.extend(self.facts(kind));
+            }
+            facts.retain(|kind, _| !heard.iter().any(|k| hears(k, kind)));
+            let words = facts.into_iter().map(|(k, body)| Word::new(k, Tense::Present, body));
+            self.words.greet(by, words.collect());
         }
     }
 
@@ -564,7 +649,7 @@ impl Town {
         let (mut going, mut ids, mut gone) = (vec![kind.to_string()], vec![who], vec![who]);
         while let Some(by) = ids.pop() {
             for (kind, body) in &under {
-                if spoken_by(body) == Some(by) {
+                if number(body, "by") == Some(by) {
                     going.push(kind.clone());
                     ids.extend(id(body));
                     gone.extend(id(body));
@@ -593,6 +678,8 @@ impl Town {
                 self.talk(Word::new(kind, Tense::Present, Body::none()));
             }
         }
+        // ended, it speaks for none: what was held under it, none will say again
+        self.held.borrow_mut().retain(|(at, _)| !within(at, kind));
     }
 
     /// What runs for the resident numbered `who`: ended as it goes (`gone`), or the town opens
@@ -604,38 +691,35 @@ impl Town {
     }
 
     /// The resident whose fact is at `kind`, numbered `who`, goes to come again, as its file is
-    /// saved: what it and those it spoke for owned is held from the square until they come again.
+    /// saved or its speaker says it is nothing: what it and those it spoke for owned is held from
+    /// the square until they come again, or their speaker says all it speaks for is said.
     pub(crate) fn leaves(&self, kind: &str, who: u64) {
-        let under = |k: &String| k == kind || k.starts_with(&format!("{kind}/"));
         let leaving: Vec<(String, Body)> = self
             .residents()
             .into_iter()
-            .filter(|(k, b)| under(k) && b.part("square").is_none())
+            .filter(|(k, b)| (k == kind || within(k, kind)) && b.part("square").is_none())
             .collect();
-        self.hold(&leaving);
         self.gone(kind, who);
+        self.hold(&leaving);
+    }
+
+    /// All the resident `who` speaks for is said, as it says a past word at `RESIDENTS`, at its
+    /// own place: what is held under it, of those it spoke for and did not say again, is let go.
+    fn all_said(&self, who: &Resident) {
+        let mine = format!("{RESIDENTS}/{}", who.place());
+        self.held.borrow_mut().retain(|(at, _)| !within(at, &mine));
     }
 
     /// What residents going to come again owned, held from the square until they come (`held`).
     fn hold(&self, going: &[(String, Body)]) {
-        let owned: Vec<(String, Owner)> = going
-            .iter()
-            .flat_map(|(kind, body)| {
-                let own = body.part("own").and_then(Parts::list).into_iter().flatten();
-                let owner = |own: &str| Owner {
-                    kind: own.into(),
-                    id: id(body).unwrap_or(0),
-                    square: false,
-                };
-                own.filter_map(Parts::text).map(move |own| (kind.clone(), owner(own)))
-            })
-            .collect();
+        let owned = going.iter().flat_map(|(kind, body)| owners(body).map(|o| (kind.clone(), o)));
         self.held.borrow_mut().extend(owned);
     }
 
     /// One `who` speaks for, at `name` under its place: what it is in `body`, checked as any
-    /// resident is as it comes; or, of nothing or as nothing, `{}`, gone. It stands as `who`
-    /// stands, and goes as it goes.
+    /// resident is as it comes; or, of nothing or as nothing, `{}`, gone, and what it owned held
+    /// from the square until it comes again, or `who` says all it speaks for is said, or goes. It
+    /// stands as `who` stands, and goes as it goes.
     fn under(&self, who: &Resident, name: &str, body: &Body) -> Result<(), String> {
         // one that says nothing of itself has no place to speak from, and none to go from
         let mine = format!("{RESIDENTS}/{}", who.place());
@@ -646,7 +730,7 @@ impl Town {
         let kind = format!("{RESIDENTS}/{place}");
         // one it spoke for before, at that place: said again, it is the same one
         let was =
-            self.present.borrow().get(&kind).filter(|b| spoken_by(b) == Some(who.id)).cloned();
+            self.present.borrow().get(&kind).filter(|b| number(b, "by") == Some(who.id)).cloned();
         let said: Resident = match body.is_none() {
             true => Resident::default(),
             false => {
@@ -654,10 +738,10 @@ impl Town {
                 serde_json::from_value(value).map_err(|e| e.to_string())?
             }
         };
-        // of nothing, or as nothing, `{}`, it has no fact: the one it had goes
+        // of nothing, or as nothing, `{}`, it has no fact: the one it had goes, to come again
         if said.nothing() {
             if let Some(gone) = was.as_ref().and_then(id) {
-                self.gone(&kind, gone);
+                self.leaves(&kind, gone);
             }
             return Ok(());
         }
@@ -676,12 +760,14 @@ impl Town {
     pub fn spoken_for(&self, who: &Resident, by: &str) -> Result<Resident, String> {
         let kind = format!("{RESIDENTS}/{}/{by}", who.place());
         let fact = self.present.borrow().get(&kind).cloned();
-        let fact = fact.filter(|f| spoken_by(f) == Some(who.id));
+        let fact = fact.filter(|f| number(f, "by") == Some(who.id));
         let fact = fact.ok_or(format!("it speaks for no resident `{by}`"))?;
         let id = id(&fact).ok_or(format!("it speaks for no resident `{by}`"))?;
         let placed = Some(format!("{}/{by}", who.place()));
-        let one =
-            Resident { id, name: by.into(), square: who.square, placed, ..Resident::default() };
+        // by the name its fact says, as its errors are known by it
+        let last = by.rsplit('/').next().unwrap_or(by);
+        let name = fact.part("name").and_then(Parts::text).unwrap_or(last).to_string();
+        let one = Resident { id, name, square: who.square, placed, ..Resident::default() };
         Ok(Resident { by: Some(who.id), ..one })
     }
 
@@ -710,14 +796,27 @@ impl Town {
         self.held.borrow_mut().retain(|(kind, _)| still(kind));
     }
 
-    /// The resident numbered `who` is told `w`: whether it is another's `town/error`, so what it
-    /// says now may answer it (`failed`); and, with none, it is told no more.
-    pub(crate) fn telling(&self, who: u64, w: Option<&Word>) {
+    /// The resident `who` is told `w`: whether it is a `town/error` not its own, so what it says
+    /// now may answer it (`failed`); and, with none, it is told no more. A speaker's own are its
+    /// own alone, so one told an error of one it speaks for answers it, as two of its files that
+    /// answer each other's errors would make them without end; at the square, those of the ones
+    /// it speaks for are its own too, as it hears them so (`Resident::hears`).
+    pub(crate) fn telling(&self, who: &Resident, w: Option<&Word>) {
         let mut answering = self.answering.borrow_mut();
-        match w.is_some_and(|w| w.kind == ERROR && w.by != who) {
-            true => answering.insert(who),
-            false => answering.remove(&who),
+        let own = |w: &Word| w.by == who.id || who.square && self.is_its(who.id, w.by);
+        match w.is_some_and(|w| w.kind == ERROR && !own(w)) {
+            true => answering.insert(who.id),
+            false => answering.remove(&who.id),
         };
+    }
+
+    /// The resident numbered `who` is told `w` alone, into its own queue, as `Words::greet` does:
+    /// not talked, so none else hears it and none keeps it. One with no queue of its own, as one
+    /// spoken for, is told through the nearest that speaks for it.
+    pub(crate) fn tell(&self, who: u64, w: Word) {
+        let chain = self.speakers_of(who);
+        let at = chain.iter().find(|&&at| self.words.holds(at)).or(chain.last());
+        self.words.greet(*at.unwrap_or(&who), vec![Word { when: now(), ..w }]);
     }
 
     /// End the group of every program running.
@@ -725,38 +824,68 @@ impl Town {
         self.groups.borrow_mut().drain().for_each(crate::unix::end_group);
     }
 
-    /// Something failed: said as a past `town/error` word, `{ from, heard, message }`, so whoever
-    /// listens can see it, and printed for the log. `heard` is the kind of word in hand when it
-    /// failed, if there was one.
+    /// Something failed: said as a past `town/error` word, `{ from, place, heard, message }`, so
+    /// whoever listens can see it, and printed for the log. `place` is where the fact of the one it
+    /// is of is (`Resident::place`), so its speaker knows which of its residents it is of; none
+    /// for town itself. `heard` is the kind of word in hand when it failed, if there was one.
     ///
     /// An error of a word in hand is only printed if it is of one hearing a `town/error`: it failed
     /// at one, or what it says while it hears one is refused or no word. Two who hear `town/error`
     /// would make each other's errors without end. Who hears one is who was told another's last
-    /// (`telling`): a Lua resident while its `listen` hears it, a program until it is told another.
+    /// (`telling`): the one told it, until it is told another.
     pub fn error(&self, from: &Resident, heard: Option<&str>, message: String) {
-        self.failed(from, message, heard.map(|kind| ("heard", kind)));
+        self.failed(from, None, message, heard.map(|kind| ("heard", kind)));
+    }
+
+    /// A fact `who` said at `kind`, `town/residents/<name>`, of one it would speak for, refused:
+    /// an error of `who`, its `place` the place that one would have had, `<who's place>/<name>`.
+    /// Told to `who` too, into its own queue, as it passes over its own errors: so it knows, and
+    /// may let that one go, even while it answers an error, when the town hears none of it.
+    fn refused(&self, who: &Resident, kind: &str, name: &str, message: String) {
+        let place = format!("{}/{name}", who.place());
+        let e = self.failed(who, Some(&place), message, Some(("heard", kind)));
+        if !who.square {
+            self.words.greet(who.id, vec![e]);
+        }
     }
 
     /// Something said that is no word: a `town/error`, with what was `said`, as far as `cut` keeps
     /// it, so whoever said it can know it for theirs.
     pub fn misheard(&self, from: &Resident, said: &str, message: String) {
-        self.failed(from, message, Some(("said", &cut(said))));
+        self.failed(from, None, message, Some(("said", &cut(said))));
     }
 
-    /// An error by the one it is of, its number on the word; but of one spoken for, by its
-    /// speaker, who said the word and is told of it (`Resident::hears`), the name its own.
-    fn failed(&self, from: &Resident, message: String, also: Option<(&str, &str)>) {
+    /// An error by the one it is of, its number on the word, so it knows its own; to one that
+    /// speaks for it, it is its own too (`Resident::hears`).
+    /// At `place`, or `from`'s own. The error, whether it is said or only printed.
+    fn failed(
+        &self,
+        from: &Resident,
+        place: Option<&str>,
+        message: String,
+        also: Option<(&str, &str)>,
+    ) -> Word {
         eprintln!("town: {}: {message}", from.name);
-        let by = from.by.unwrap_or(from.id);
-        let answering = also.is_some() && self.answering.borrow().contains(&by);
-        if also == Some(("heard", ERROR)) || answering {
-            return;
-        }
+        let by = from.id;
+        // told another's error, it or one that speaks for it, however deep: one spoken for may be
+        // told as itself, or through its speaker
+        let told = self.answering.borrow();
+        let answering = also.is_some()
+            && (told.iter().any(|&t| self.is_its(t, by))
+                || from.by.is_some_and(|b| told.contains(&b)));
+        drop(told);
         let mut body = Parts::map([("from", from.name.as_str()), ("message", &message)]);
+        if by != 0 {
+            body.set("place", place.map_or_else(|| from.place(), String::from));
+        }
         if let Some((name, part)) = also {
             body.set(name, part);
         }
-        self.talk(Word { by, ..Word::new(ERROR, Tense::Past, Body::of(body)) });
+        let e = Word { by, when: now(), ..Word::new(ERROR, Tense::Past, Body::of(body)) };
+        if also != Some(("heard", ERROR)) && !answering {
+            self.talk(e.clone());
+        }
+        e
     }
 
     /// May `who` say this word? Not town's own, from the square; and not what is, or was, of a kind
@@ -768,7 +897,9 @@ impl Town {
         if w.kind == RESIDENTS {
             return Err(format!("`{RESIDENTS}` is town's to say"));
         }
-        if who.square && towns(&w.kind) {
+        // a read only reads: what one at the square hears, it may ask town of too
+        let read = w.kind == "town/read" && w.tense == Tense::Future;
+        if who.square && towns(&w.kind) && !read {
             return Err(format!("`{}` is town's own", w.kind));
         }
         // to want what is joined is to have town run it: town's own, as `town/join` is
@@ -808,22 +939,33 @@ impl Town {
     }
 
     /// The one door a word comes in by, from whoever says it: said in town if `who` may say it,
-    /// stamped with the moment it is, whatever `when` it came with; and if not, said back as a
-    /// `town/error` from it.
+    /// stamped with the moment it is, whatever `when` it came with, and a `town/error` with its
+    /// `place`; and if not, said back as a `town/error` from it.
     pub fn said(&self, w: Word, who: &Resident) {
         // a resident under its own place, placed from where it stands, as a join's words are
         // from its kind: it says that one is there, or is no longer
         let mine = format!("{RESIDENTS}/");
         if let Some(name) = w.kind.strip_prefix(&mine).filter(|_| w.tense == Tense::Present) {
-            let under = match who.lua {
-                true => Err("a Lua resident speaks for none: its words have no `by`".into()),
-                false => self.under(who, name, &w.body),
-            };
-            if let Err(why) = under {
-                self.error(who, Some(&w.kind), why);
+            if let Err(why) = self.under(who, name, &w.body) {
+                self.refused(who, &w.kind, name, why);
             }
             return;
         }
+        // at its own place, as it stands there: all it speaks for is said. Not from the square,
+        // where what is held is never under it
+        let all = w.kind == RESIDENTS && w.tense == Tense::Past && w.body.is_none();
+        if all && !who.square {
+            return self.all_said(who);
+        }
+        // an error it says is of it: at its place, as town stamps each it says itself
+        let w = match w.kind == ERROR && matches!(w.body.parts(), Parts::Map(_)) {
+            true => {
+                let mut body = w.body.parts().clone();
+                body.set("place", who.place());
+                Word { body: Body::of(body), ..w }
+            }
+            false => w,
+        };
         match self.may(&w, who) {
             Ok(()) => self.talk(Word { by: who.id, when: 0, ..w }),
             Err(why) => self.error(who, Some(&w.kind), why),
@@ -840,16 +982,11 @@ impl Town {
             return self.error(&Resident::town(), None, message);
         }
         if word.when == 0 {
-            word.when = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            word.when = now();
         }
-        let was = resident(&word.kind)
-            && self.present.borrow().get(&word.kind).is_some_and(|b| !spoken(b).is_empty());
         let kept = keep(&mut self.present.borrow_mut(), &word);
         if kept && resident(&word.kind) {
-            self.own(&word.kind, was);
+            self.own(&word.kind);
         }
         if kept && logged(&word.kind) {
             self.grown.set(self.grown.get() + log::append(&self.log, &word));
@@ -937,6 +1074,19 @@ impl Town {
     }
 }
 
+/// The moment it is, in milliseconds since 1970: what town stamps each word said with.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether `kind` is under `at`, and not `at` itself.
+fn within(kind: &str, at: &str) -> bool {
+    kind.strip_prefix(at).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// How much of what is said a `town/error` holds of it: a line that is no word, a program's
 /// stderr. One may say up to `MOST` that is no word, and each error waits for whoever hears it.
 const SAID: usize = 1024;
@@ -983,6 +1133,7 @@ fn keep(present: &mut BTreeMap<String, Body>, w: &Word) -> bool {
 mod tests {
     use super::*;
     use crate::testing::scratch;
+    use serde_json::json;
 
     // the tail of the log holds the whole last line, wherever its window begins, inside a char
     // of many bytes too
@@ -1106,7 +1257,7 @@ mod tests {
         let town = Town::with_log(log.clone());
         let mine = vec!["mine".to_string()];
         let file = |who: Resident| Resident {
-            file: Some("/a/b/theme.lua".into()),
+            placed: Some("a/b/theme.lua".into()),
             own: mine.clone(),
             ..who
         };
@@ -1137,19 +1288,22 @@ mod tests {
     fn a_resident_speaks_for_those_under_it() {
         let dir = scratch();
         let town = Town::with_log(dir.log());
-        let host = town.who("host", false);
-        let here = town.come(&Resident { kinds: vec!["x".into()], ..host.clone() }).unwrap();
+        let speaker = town.who("speaker", false);
+        let here = town.come(&Resident { kinds: vec!["x".into()], ..speaker.clone() }).unwrap();
         let said = |kind: &str, body: serde_json::Value| {
-            town.said(Word::new(kind, Tense::Present, Body::of(body)), &host)
+            town.said(Word::new(kind, Tense::Present, Body::of(body)), &speaker)
         };
         said("town/residents/theme.lua", serde_json::json!({ "own": ["theme"] }));
-        let theme = town.spoken_for(&host, "theme.lua").unwrap();
-        assert_eq!(theme.place(), format!("{}/theme.lua", host.place()), "under its place");
+        let theme = town.spoken_for(&speaker, "theme.lua").unwrap();
+        assert_eq!(theme.place(), format!("{}/theme.lua", speaker.place()), "under its place");
+        // one at a path is known by its name, as its fact says it
+        said("town/residents/a/b/deep.lua", serde_json::json!({ "kinds": ["x"] }));
+        assert_eq!(town.spoken_for(&speaker, "a/b/deep.lua").unwrap().name, "deep.lua");
         let fact = town.facts(&format!("{RESIDENTS}/{}", theme.place()));
         assert_eq!(fact.values().next().unwrap().value()["own"], serde_json::json!(["theme"]));
         let word = Word::new("theme", Tense::Present, Body::of("dark"));
         assert!(town.may(&word, &theme).is_ok(), "its own");
-        assert!(town.may(&word, &host).is_err(), "not its speaker's");
+        assert!(town.may(&word, &speaker).is_err(), "not its speaker's");
         assert!(town.may(&Word::new("town/work", Tense::Future, Body::none()), &theme).is_ok());
         let square = town.who("square", true);
         let _sq = town.come(&Resident { kinds: vec!["x".into()], ..square.clone() }).unwrap();
@@ -1165,22 +1319,22 @@ mod tests {
         let a = town.spoken_for(&square, "a").unwrap();
         assert!(a.square, "it stands as its speaker stands");
         let mine = |own: &str| Body::of(serde_json::json!({ "own": [own] }));
-        town.said(Word::new("town/residents/b", Tense::Present, mine("theme")), &host);
+        town.said(Word::new("town/residents/b", Tense::Present, mine("theme")), &speaker);
         assert!(errors.try_recv().is_ok(), "checked as any that comes: another owns theme");
-        assert!(town.spoken_for(&host, "nobody").is_err());
+        assert!(town.spoken_for(&speaker, "nobody").is_err());
         // said again, it is the same one, not another that would own what it owns
         let again = |own: &str| Word::new("town/residents/theme.lua", Tense::Present, mine(own));
-        town.said(again("theme"), &host);
+        town.said(again("theme"), &speaker);
         assert!(errors.try_recv().is_err(), "the same one");
-        assert_eq!(town.spoken_for(&host, "theme.lua").unwrap().id, theme.id);
+        assert_eq!(town.spoken_for(&speaker, "theme.lua").unwrap().id, theme.id);
         // one under its place that it does not speak for is not its, and stays as it goes
         let nested = Resident {
             kinds: vec!["x".into()],
-            placed: Some(format!("{}/nested", host.place())),
+            placed: Some(format!("{}/nested", speaker.place())),
             ..town.who("nested", false)
         };
         let _nested = town.come(&nested).unwrap();
-        assert!(town.spoken_for(&host, "nested").is_err(), "it speaks for it not");
+        assert!(town.spoken_for(&speaker, "nested").is_err(), "it speaks for it not");
         // one it speaks for may speak for others, and they go with it, however deep
         let deeper = Word::new(
             "town/residents/x",
@@ -1189,14 +1343,14 @@ mod tests {
         );
         town.said(deeper.clone(), &theme);
         assert!(town.spoken_for(&theme, "x").is_ok(), "spoken for by the one spoken for");
-        // taken away, it goes with those it spoke for; and said again, they may come again
-        let away = Word::new("town/residents/theme.lua", Tense::Present, Body::none());
-        town.said(away, &host);
-        assert!(town.spoken_for(&host, "theme.lua").is_err(), "taken away");
+        // said as nothing, `{}`, it goes with those it spoke for; said again, they may come again
+        let away = Word::new("town/residents/theme.lua", Tense::Present, Body::of(json!({})));
+        town.said(away, &speaker);
+        assert!(town.spoken_for(&speaker, "theme.lua").is_err(), "taken away");
         let x = town.facts(&format!("{RESIDENTS}/{}/x", theme.place()));
         assert!(x.is_empty(), "and the one it spoke for, with it");
-        town.said(again("theme"), &host);
-        let theme = town.spoken_for(&host, "theme.lua").unwrap();
+        town.said(again("theme"), &speaker);
+        let theme = town.spoken_for(&speaker, "theme.lua").unwrap();
         town.said(deeper, &theme);
         // one that says nothing of itself speaks for none
         let quiet = town.who("quiet", false);
@@ -1206,7 +1360,7 @@ mod tests {
         let _ = errors.try_recv();
         // the paths town was opened with, it alone says
         let paths = Word::new(RESIDENTS, Tense::Present, Body::of(serde_json::json!(["/tmp"])));
-        assert!(town.may(&paths, &host).is_err(), "town's to say");
+        assert!(town.may(&paths, &speaker).is_err(), "town's to say");
         // one place, one resident: none may come where another is
         let at = Resident { at: Some(theme.place()), ..town.who("join", false) };
         assert!(
@@ -1219,30 +1373,12 @@ mod tests {
             "gone with the one that speaks for it, however deep"
         );
         assert!(
-            town.spoken_for(&host, "theme.lua").is_err(),
+            town.spoken_for(&speaker, "theme.lua").is_err(),
             "gone with the one that speaks for it"
         );
         let left = town.facts(&format!("{RESIDENTS}/{}", nested.place()));
         assert_eq!(left.len(), 1, "but not one it did not speak for");
         assert!(town.may(&word, &town.who("other", false)).is_ok(), "and what it owned, let go");
-    }
-
-    // a Lua resident speaks for none, as its words have no `by`: what it says under its place is
-    // refused, and none comes there
-    #[test]
-    fn a_lua_resident_speaks_for_none() {
-        let dir = scratch();
-        let town = Town::with_log(dir.log());
-        let lua = Resident { lua: true, kinds: vec!["x".into()], ..town.who("a", false) };
-        let _here = town.come(&lua).unwrap();
-        let mut errors = town.words.hear(|_, w| w.kind == ERROR, None);
-        let one = Body::of(serde_json::json!({ "own": ["theme"] }));
-        town.said(Word::new("town/residents/theme", Tense::Present, one), &lua);
-        assert!(town.spoken_for(&lua, "theme").is_err(), "none comes");
-        let e = errors.try_recv().expect("refused");
-        assert!(e.body.value()["message"].as_str().unwrap().contains("speaks for none"));
-        let theme = Word::new("theme", Tense::Past, Body::none());
-        assert!(town.may(&theme, &town.who("other", false)).is_ok(), "nor owns");
     }
 
     // what the residents of an opening owned is held from the square across a reopen, until they
@@ -1252,7 +1388,7 @@ mod tests {
         let dir = scratch();
         let town = Town::with_log(dir.log());
         let program = |town: &Town| Resident {
-            file: Some("/a/themer".into()),
+            placed: Some("a/themer".into()),
             own: vec!["theme".into()],
             ..town.who("themer", false)
         };
@@ -1271,24 +1407,6 @@ mod tests {
         town.reopen();
         town.hold_only(|_| false);
         assert!(town.come(&square()).is_ok(), "let go, as none will come");
-    }
-
-    // one said again as nothing, `{}`, is gone, and what it owned is let go
-    #[test]
-    fn one_said_again_as_nothing_goes() {
-        let dir = scratch();
-        let town = Town::with_log(dir.log());
-        let host = town.who("host", false);
-        let _here = town.come(&Resident { kinds: vec!["x".into()], ..host.clone() }).unwrap();
-        let said = |body: serde_json::Value| {
-            town.said(Word::new("town/residents/theme", Tense::Present, Body::of(body)), &host)
-        };
-        said(serde_json::json!({ "own": ["theme"] }));
-        assert!(town.spoken_for(&host, "theme").is_ok());
-        said(serde_json::json!({}));
-        assert!(town.spoken_for(&host, "theme").is_err(), "gone");
-        let theme = Word::new("theme", Tense::Past, Body::none());
-        assert!(town.may(&theme, &town.who("other", false)).is_ok(), "and what it owned, let go");
     }
 
     // one place, one owner; a place under another's is another place, and its owner is
@@ -1333,22 +1451,6 @@ mod tests {
             assert!(town.come(&join(around)).is_err(), "around it: {around}");
         }
         assert!(town.come(&join("box")).is_ok(), "beside it, not around it");
-    }
-
-    // who owns what follows the residents' facts: said, it owns; taken away, it lets go
-    #[test]
-    fn ownership_follows_a_residents_fact() {
-        let dir = scratch();
-        let town = Town::with_log(dir.log());
-        let (a, b) = (town.who("a", false), town.who("b", false));
-        let mine = Word::new("mine", Tense::Past, Body::none());
-        let fact = format!("{RESIDENTS}/{}", a.id);
-        let body = serde_json::json!({ "id": a.id, "own": ["mine"] });
-        town.talk(Word::new(fact.as_str(), Tense::Present, Body::of(body)));
-        assert!(town.may(&mine, &a).is_ok() && town.may(&mine, &b).is_err(), "said, it owns");
-        assert!(town.come(&Resident { own: vec!["mine".into()], ..b.clone() }).is_err());
-        town.talk(Word::new(fact.as_str(), Tense::Present, Body::none()));
-        assert!(town.may(&mine, &b).is_ok(), "taken away, it lets go");
     }
 
     // who is here is kept in the present, never in the log; and a town started from an old log
@@ -1574,5 +1676,223 @@ mod tests {
         assert_eq!(std::iter::from_fn(|| words.try_recv().ok()).count(), 3);
         assert_eq!(*town.present.borrow(), BTreeMap::from([("theme".into(), Body::of("present"))]));
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    // what is said by one spoken for is its speaker's: so a speaker at the square told an error of
+    // it is told the next too; and one inside hears it as any error, by its place, known still
+    // once its fact is gone
+    #[test]
+    fn an_error_of_one_spoken_for_is_its_speakers() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        let square = Resident { kinds: vec!["x".into()], ..town.who("sq", true) };
+        let _here = town.come(&square).unwrap();
+        let it = Body::of(serde_json::json!({ "kinds": ["x"] }));
+        town.said(Word::new("town/residents/a", Tense::Present, it), &square);
+        let a = town.spoken_for(&square, "a").unwrap();
+        let mut errors = town.words.hear(|_, w| w.kind == ERROR, None);
+        let work = || Word::new("town/work", Tense::Future, Body::none());
+        town.said(work(), &a);
+        let first = errors.try_recv().expect("refused");
+        assert!(square.hears(&town, &first), "its own, at the square");
+        town.telling(&square, Some(&first));
+        town.said(work(), &a);
+        assert!(errors.try_recv().is_ok(), "the next refused is said too");
+        // one gone: its error is its speaker's still
+        let inside = Resident { kinds: vec![ERROR.into()], ..town.who("in", false) };
+        let _in = town.come(&inside).unwrap();
+        let join = Resident { by: Some(inside.id), at: Some("j".into()), ..town.who("j", false) };
+        drop(town.come(&join).unwrap());
+        town.error(&join, None, "cannot join".into());
+        let e = errors.try_recv().expect("said");
+        assert!(inside.hears(&town, &e), "its join's, though the join is gone");
+        assert_eq!(e.body.value()["place"], "j", "by its place");
+    }
+
+    // a speaker hears the errors of those it speaks for, each with its place, a sibling's to one
+    // that hears errors among them; and never its own
+    #[test]
+    fn a_speaker_hears_the_errors_of_those_it_speaks_for_not_its_own() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        let owner = Resident { own: vec!["theme".into()], ..town.who("owner", false) };
+        let _owner = town.come(&owner).unwrap();
+        let s = Resident { kinds: vec!["s".into()], ..town.who("s", false) };
+        let _s = town.come(&s).unwrap();
+        let it = |kinds: serde_json::Value| Body::of(serde_json::json!({ "kinds": kinds }));
+        town.said(Word::new(format!("{RESIDENTS}/a"), Tense::Present, it(json!([ERROR]))), &s);
+        town.said(Word::new(format!("{RESIDENTS}/b"), Tense::Present, it(json!(["x"]))), &s);
+        let b = town.spoken_for(&s, "b").unwrap();
+        let mut errors = town.words.hear(|_, w| w.kind == ERROR, None);
+        let theme = || Word::new("theme", Tense::Past, Body::none());
+        town.said(theme(), &b);
+        let e = errors.try_recv().expect("refused");
+        assert!(s.hears(&town, &e), "a sibling's, as a hears errors");
+        assert_eq!(e.body.value()["place"], b.place(), "and whose it is");
+        let says = Body::of(json!({ "message": "mine", "place": "elsewhere" }));
+        town.said(Word::new(ERROR, Tense::Past, says), &b);
+        let e = errors.try_recv().expect("said");
+        assert_eq!(e.body.value()["place"], b.place(), "one it says, at its place");
+        town.said(theme(), &s);
+        let e = errors.try_recv().expect("refused");
+        assert_eq!(e.body.value()["place"], s.place());
+        assert!(!s.hears(&town, &e), "its own, never");
+    }
+
+    // a fact a speaker says of one it would speak for, refused, is its error, at the place that
+    // one would have had, and told to it, though it hears nothing of errors; while it answers an
+    // error, the town hears none of it, and it is told still
+    #[test]
+    fn a_refused_fact_is_the_speakers_error_at_the_place_it_would_have() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        let owner = Resident { own: vec!["theme".into()], ..town.who("owner", false) };
+        let _owner = town.come(&owner).unwrap();
+        let s = Resident { kinds: vec!["s".into()], ..town.who("s", false) };
+        let _s = town.come(&s).unwrap();
+        let mut mine = s.listening(&town);
+        let mut errors = town.words.hear(|_, w| w.kind == ERROR, None);
+        let theme = Body::of(json!({ "own": ["theme"] }));
+        town.said(Word::new(format!("{RESIDENTS}/x"), Tense::Present, theme), &s);
+        let e = errors.try_recv().expect("refused");
+        let body = e.body.value();
+        assert_eq!((body["from"].clone(), e.by), (json!("s"), s.id), "the speaker's");
+        assert_eq!(body["heard"], format!("{RESIDENTS}/x"), "as it said it");
+        assert_eq!(body["place"], format!("{}/x", s.place()), "where that one would be");
+        assert!(body["message"].as_str().unwrap().contains("another owns"));
+        let told = std::iter::from_fn(|| mine.try_recv().ok()).find(|w| w.kind == ERROR);
+        assert_eq!(told.map(|w| w.body), Some(e.body.clone()), "told to it");
+        town.telling(&s, Some(&Word { by: owner.id, ..e }));
+        let theme = Body::of(json!({ "own": ["theme"] }));
+        town.said(Word::new(format!("{RESIDENTS}/y"), Tense::Present, theme), &s);
+        assert!(errors.try_recv().is_err(), "an answer to an error is not said");
+        let told = std::iter::from_fn(|| mine.try_recv().ok()).find(|w| w.kind == ERROR);
+        let place = told.map(|w| w.body.value()["place"].clone());
+        assert_eq!(place, Some(json!(format!("{}/y", s.place()))), "it is told still");
+    }
+
+    // what one a speaker speaks for owned is held from the square from its fact of nothing until
+    // it comes again, or its speaker says all it speaks for is said, or ends; what is not said
+    // again is let go then; and from the square, none says it
+    #[test]
+    fn what_one_spoken_for_owned_is_held_until_all_is_said() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        let s = Resident { kinds: vec!["s".into()], ..town.who("s", false) };
+        let here = town.come(&s).unwrap();
+        let sub = |own: serde_json::Value| {
+            let body = if own.is_null() { Body::none() } else { Body::of(json!({ "own": own })) };
+            town.said(Word::new(format!("{RESIDENTS}/f.lua"), Tense::Present, body), &s);
+        };
+        let all = Word::new(RESIDENTS, Tense::Past, Body::none());
+        let square = || Resident { own: vec!["theme".into()], ..town.who("square", true) };
+        sub(json!(["theme"]));
+        sub(json!(null));
+        assert!(town.come(&square()).is_err(), "held between its fact of nothing and its new one");
+        sub(json!(["theme"]));
+        assert!(town.come(&square()).is_err(), "its own again");
+        sub(json!(null));
+        town.said(all.clone(), &s);
+        assert!(town.come(&square()).is_ok(), "not said again: let go, as all is said");
+        sub(json!(["other"]));
+        sub(json!(null));
+        let other = || Resident { own: vec!["other".into()], ..town.who("square", true) };
+        assert!(town.come(&other()).is_err(), "held");
+        drop(here);
+        assert!(town.come(&other()).is_ok(), "let go as its speaker ends");
+        let mut errors = town.words.hear(|_, w| w.kind == ERROR, None);
+        town.said(all, &town.who("sq", true));
+        assert!(errors.try_recv().is_ok(), "from the square, refused");
+    }
+
+    // what is held under a speaker outlives a whole reopen, as it comes again, until it says all it
+    // speaks for is said
+    #[test]
+    fn what_is_held_under_a_speaker_outlives_a_reopen_until_all_is_said() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        let speaker = |town: &Town| Resident {
+            placed: Some("a/lua".into()),
+            kinds: vec!["s".into()],
+            ..town.who("lua", false)
+        };
+        let s = speaker(&town);
+        let _first = town.come(&s).unwrap();
+        let theme = Body::of(json!({ "own": ["theme"] }));
+        town.said(Word::new(format!("{RESIDENTS}/f.lua"), Tense::Present, theme), &s);
+        town.reopen();
+        let square = || Resident { own: vec!["theme".into()], ..town.who("square", true) };
+        let s = speaker(&town);
+        let _again = town.come(&s).unwrap();
+        assert!(town.come(&square()).is_err(), "held as it comes again");
+        town.said(Word::new(RESIDENTS, Tense::Past, Body::none()), &s);
+        assert!(town.come(&square()).is_ok(), "let go as all is said");
+    }
+
+    // a speaker hears what those it speaks for hear, however deep, as their facts say: not what is
+    // wanted of them, and not once they go, unless it or another hears it still
+    #[test]
+    fn a_speaker_hears_what_those_it_speaks_for_hear() {
+        crate::testing::run(async {
+            let dir = scratch();
+            let town = Town::with_log(dir.log());
+            let s = Resident { kinds: vec!["s".into()], ..town.who("s", false) };
+            let _s = town.come(&s).unwrap();
+            let word = |kind: &str| Word::new(kind, Tense::Past, Body::none());
+            let light = s.hearing();
+            let hears = |kind: &str| s.hears(&town, &word(kind)) && light(&town, &word(kind));
+            let it = |kinds: serde_json::Value| Body::of(serde_json::json!({ "kinds": kinds }));
+            let say = |name: &str, body: Body, by: &Resident| {
+                town.said(Word::new(format!("{RESIDENTS}/{name}"), Tense::Present, body), by)
+            };
+            assert!(!hears("x"), "none it speaks for hears it yet");
+            say("a", it(serde_json::json!(["x"])), &s);
+            assert!(hears("x") && hears("s"), "one it speaks for hears it, and its own");
+            let a = town.spoken_for(&s, "a").unwrap();
+            say("b", it(serde_json::json!(["y/"])), &a);
+            assert!(hears("y/1"), "one that one speaks for hears it: two deep");
+            // one it speaks for stands at a join: what is wanted there is told to it, not to s
+            let j = Resident { by: Some(s.id), at: Some("j".into()), ..town.who("j", false) };
+            let here = town.come(&j).unwrap();
+            let run = tokio::task::spawn_local(std::future::pending::<()>());
+            let joined = Joined {
+                who: j.clone(),
+                _here: here,
+                _run: crate::program::Ends(run.abort_handle()),
+            };
+            town.joins.borrow_mut().insert("j".into(), joined);
+            let wanted = Word::new("j", Tense::Future, Body::none());
+            assert!(
+                j.hears(&town, &wanted) && !s.hears(&town, &wanted),
+                "not what is wanted of it"
+            );
+            let joined = town.joins.borrow_mut().remove("j");
+            drop(joined);
+            // one goes: what it heard is heard no more, but what another hears, or s itself
+            say("c", it(serde_json::json!(["x", "s"])), &s);
+            say("a", Body::none(), &s);
+            assert!(!hears("y/1"), "gone, and those it spoke for with it");
+            assert!(hears("x") && hears("s"), "another hears it still, and it does");
+            say("c", Body::none(), &s);
+            assert!(!hears("x") && hears("s"), "none it speaks for hears it");
+        });
+    }
+
+    // a speaker is not told again, as one it speaks for comes, a fact its own kinds hear already
+    #[test]
+    fn a_speaker_is_not_told_again_what_its_own_kinds_hear() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        town.talk(Word::new(RESIDENTS, Tense::Present, Body::of(serde_json::json!(["/a"]))));
+        let lua = Resident { kinds: vec![format!("/{RESIDENTS}")], ..town.who("lua", false) };
+        let _here = town.come(&lua).unwrap();
+        let mut words = lua.listening(&town);
+        let reload = Body::of(serde_json::json!({ "kinds": [RESIDENTS, "/reload"] }));
+        town.said(Word::new(format!("{RESIDENTS}/reload.lua"), Tense::Present, reload), &lua);
+        let told: Vec<String> = std::iter::from_fn(|| words.try_recv().ok())
+            .filter(|w| w.kind == RESIDENTS)
+            .map(|w| format!("{} {}", w.kind, w.tense.name()))
+            .collect();
+        assert!(told.is_empty(), "the paths, which it hears already, not told again: {told:?}");
     }
 }

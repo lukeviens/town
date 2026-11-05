@@ -1,4 +1,4 @@
-//! `town-watch`, joined, as a resident joins it: what a path holds, said as facts of a kind; and a
+//! `watch`, joined, as a resident joins it: what a path holds, said as facts of a kind; and a
 //! town that reloads with it.
 //!   cargo test --test watch
 
@@ -7,14 +7,14 @@ use std::path::Path;
 use serde_json::json;
 use town::body::Body;
 use town::parts::Parts;
-use town::town::Town;
+use town::town::{Listening, Town};
 use town::word::{Tense, Word};
 
 use town::testing::{self, guard, scratch, until, upto};
 
-/// `path` watched under `kind`, as a resident joins `town-watch`
+/// `path` watched under `kind`, as a resident joins `watch`
 fn watch(town: &Town, kind: &str, path: &Path) {
-    let argv = json!([env!("CARGO_BIN_EXE_town-watch"), path]);
+    let argv = json!([env!("CARGO_BIN_EXE_watch"), path]);
     let join = json!({ "as": kind, "argv": argv });
     town.talk(Word::new("town/join", Tense::Future, Body::of(join)));
 }
@@ -38,6 +38,18 @@ fn file(path: &Path) -> Body {
     Body::of(Parts::from(json!({ "path": path, "changed": changed, "size": meta.len() })))
 }
 
+/// the next word said at `kind`, its body
+async fn said(words: &mut Listening, kind: &str) -> Body {
+    until(words, |w| w.kind == kind).await.body
+}
+
+/// `kind` said as `path` is now. A write makes a file, then fills it, and the watch may say it
+/// between: what is waited for is the file as written.
+async fn written(words: &mut Listening, kind: &str, path: &Path) {
+    let now = file(path);
+    until(words, |w| w.kind == kind && w.body == now).await;
+}
+
 /// whether `kind` is the watch's own: no one else may say it
 fn own(town: &Town, kind: &str) -> bool {
     town.may(&Word::new(kind, Tense::Present, Body::none()), &town.who("square", true)).is_err()
@@ -58,7 +70,7 @@ fn a_file_is_said_as_where_it_is() {
         std::fs::remove_file(&colors).unwrap();
         assert!(until(&mut words, fact).await.body.is_none());
         std::fs::write(&colors, "bg=#fff").unwrap();
-        assert_eq!(until(&mut words, fact).await.body, file(&colors));
+        written(&mut words, "colors", &colors).await;
     });
 }
 
@@ -75,8 +87,7 @@ fn what_town_has_is_not_said_again() {
         let joined = upto(&mut words, |w| w.kind == "colors" && w.tense == Tense::Past).await;
         assert!(!joined.iter().any(fact), "not again");
         std::fs::write(&colors, "bg=#111").unwrap();
-        let next = until(&mut words, fact).await;
-        assert_eq!(next.body, file(&colors), "the change, not what town had");
+        written(&mut words, "colors", &colors).await; // the change, not what town had
     });
 }
 
@@ -97,23 +108,22 @@ fn a_folder_is_said_as_each_file_in_it() {
         town.talk(Word::new("files/old", Tense::Present, Body::of("x")));
         let mut words = town.words.listen();
         watch(town, "files", &folder);
-        let mut next = async |kind: &str| until(&mut words, |w| w.kind == kind).await.body;
-        assert_eq!(next("files/a").await, file(&folder.join("a")));
-        assert_eq!(next("files/sub/b").await, file(&folder.join("sub/b")));
-        assert!(next("files/old").await.is_none(), "let go");
+        assert_eq!(said(&mut words, "files/a").await, file(&folder.join("a")));
+        assert_eq!(said(&mut words, "files/sub/b").await, file(&folder.join("sub/b")));
+        assert!(said(&mut words, "files/old").await.is_none(), "let go");
         assert!(own(town, "files/a"), "its own");
         std::fs::write(folder.join("a"), "11").unwrap();
-        assert_eq!(next("files/a").await, file(&folder.join("a")));
+        written(&mut words, "files/a", &folder.join("a")).await;
         std::fs::remove_file(folder.join("sub/b")).unwrap();
-        assert!(next("files/sub/b").await.is_none(), "gone");
+        assert!(said(&mut words, "files/sub/b").await.is_none(), "gone");
         // a folder come whole and gone whole: each file in it, then each as nothing
         let aside = dir.join("aside");
         std::fs::create_dir_all(&aside).unwrap();
         std::fs::write(aside.join("c"), "3").unwrap();
         std::fs::rename(&aside, folder.join("more")).unwrap();
-        assert_eq!(next("files/more/c").await, file(&folder.join("more/c")));
+        assert_eq!(said(&mut words, "files/more/c").await, file(&folder.join("more/c")));
         std::fs::rename(folder.join("more"), dir.join("away")).unwrap();
-        assert!(next("files/more/c").await.is_none());
+        assert!(said(&mut words, "files/more/c").await.is_none());
         let facts: Vec<String> = town.facts("files/").into_keys().collect();
         assert_eq!(facts, ["files/a"], "nothing hidden, nothing gone");
     });
@@ -134,15 +144,14 @@ fn a_link_is_followed_where_it_leads() {
         std::os::unix::fs::symlink(dir.join("build/out"), folder.join("later")).unwrap();
         let mut words = town.words.listen();
         watch(town, "files", &folder);
-        let mut next = async |kind: &str| until(&mut words, |w| w.kind == kind).await.body;
-        assert_eq!(next("files/theme/colors").await, file(&folder.join("theme/colors")));
+        written(&mut words, "files/theme/colors", &folder.join("theme/colors")).await;
         std::fs::write(outside.join("colors"), "bg=#111").unwrap();
-        assert_eq!(next("files/theme/colors").await, file(&folder.join("theme/colors")));
+        written(&mut words, "files/theme/colors", &folder.join("theme/colors")).await;
         let under: Vec<String> = town.facts("files/").into_keys().collect();
         assert_eq!(under, ["files/theme/colors"], "the link back up, read once");
         std::fs::create_dir_all(dir.join("build")).unwrap();
         std::fs::write(dir.join("build/out"), "built").unwrap();
-        assert_eq!(next("files/later").await, file(&folder.join("later")));
+        written(&mut words, "files/later", &folder.join("later")).await;
     });
 }
 
@@ -156,8 +165,7 @@ fn a_path_not_there_yet_is_heard_as_it_comes() {
         until(&mut words, |w| w.kind == "colors" && w.tense == Tense::Past).await; // joined
         std::fs::create_dir(dir.join("theme")).unwrap();
         std::fs::write(&colors, "bg=#000").unwrap();
-        let fact = until(&mut words, |w| w.kind == "colors" && w.tense == Tense::Present).await;
-        assert_eq!(fact.body, file(&colors));
+        written(&mut words, "colors", &colors).await;
     });
 }
 
@@ -172,8 +180,7 @@ fn a_file_named_through_a_link_is_heard_as_it_comes() {
         watch(town, "colors", &colors);
         until(&mut words, |w| w.kind == "colors" && w.tense == Tense::Past).await; // joined
         std::fs::write(&colors, "bg=#000").unwrap();
-        let fact = until(&mut words, |w| w.kind == "colors" && w.tense == Tense::Present).await;
-        assert_eq!(fact.body, file(&colors));
+        written(&mut words, "colors", &colors).await;
     });
 }
 
@@ -224,16 +231,20 @@ fn a_saved_resident_opens_the_town_again() {
     let dir = scratch();
     let (top, aside) = (dir.join("town"), dir.join("aside"));
     let reload = include_str!("../residents/reload.lua");
-    let reloads = |at: &Path| std::fs::write(at.join("reload.lua"), reload).unwrap();
+    // reload is a Lua file: `lua`, built, linked in, speaks for it
+    let reloads = |at: &Path| {
+        std::fs::write(at.join("reload.lua"), reload).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_lua"), at.join("lua")).unwrap();
+    };
     std::fs::create_dir_all(&top).unwrap();
     reloads(&top);
     made(&top, "first");
     testing::run(async {
-        // its world finds town's own programs, `town-watch` among them, on its PATH
-        let world = testing::world_with(Path::new(env!("CARGO_BIN_EXE_town-watch")));
+        // its world gives town's watch at `WATCH`
+        let world = testing::world_with(Path::new(env!("CARGO_BIN_EXE_watch")));
         let town = Town::in_world(dir.log(), world);
         let mut words = town.words.listen();
-        town::residents::keep(mlua::Lua::new, &town, vec![top.clone()]);
+        town::residents::keep(&town, vec![top.clone()]);
         // the word; and, when `reload` itself comes again, its watch begun, now, so the next save
         // is heard: a save of any other resident leaves it watching
         let watch = format!("reload{}", top.display());
@@ -285,13 +296,14 @@ fn a_path_inside_another_is_watched_once() {
     let (top, sub) = (dir.join("town"), dir.join("town/sub"));
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(top.join("reload.lua"), include_str!("../residents/reload.lua")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_lua"), top.join("lua")).unwrap();
     made(&sub, "inner");
     testing::run(async {
-        let world = testing::world_with(Path::new(env!("CARGO_BIN_EXE_town-watch")));
+        let world = testing::world_with(Path::new(env!("CARGO_BIN_EXE_watch")));
         let town = Town::in_world(dir.log(), world);
         let mut words = town.words.listen();
         let mut errors = town.words.hear(|_, w| w.kind == town::word::ERROR, None);
-        town::residents::keep(mlua::Lua::new, &town, vec![top.clone(), sub.clone()]);
+        town::residents::keep(&town, vec![top.clone(), sub.clone()]);
         let watch = format!("reload{}", top.display());
         let begun = |w: &Word| w.kind == watch && w.tense == Tense::Past && w.body.is_none();
         until(&mut words, begun).await;

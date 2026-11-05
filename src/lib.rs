@@ -3,7 +3,6 @@
 pub mod body;
 pub mod language;
 pub mod log;
-pub mod lua;
 pub mod parts;
 pub mod paths;
 pub mod program;
@@ -17,6 +16,3 @@ pub mod work;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
-
-/// How a resident is written, loaded before a town's own files.
-pub const RESIDENT: &str = include_str!("resident.lua");

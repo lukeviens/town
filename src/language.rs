@@ -31,12 +31,6 @@ pub enum Read {
 }
 
 impl Language {
-    /// JSON, the same one wherever it is asked for
-    pub fn json() -> Rc<Language> {
-        thread_local!(static JSON: Rc<Language> = Rc::new(Language::Json));
-        JSON.with(Rc::clone)
-    }
-
     /// The first of what `bytes` hold, in this language: JSON a line at a time, a grammar as far as
     /// it reads. `ended` once no more will come.
     pub fn read(&self, bytes: &[u8], ended: bool, languages: &Languages) -> Read {
@@ -108,14 +102,10 @@ struct Spoken {
 
 impl Languages {
     /// a language said: a later one of the same name takes its place
+    #[cfg(test)]
     pub fn say(&self, name: &str, grammar: Grammar) {
-        self.made("", name, &Parts::None, grammar);
-    }
-
-    /// the language `name`, made of `grammar` for the resident `at`, ready for its fact (`are`)
-    pub fn made(&self, at: &str, name: &str, grammar: &Parts, made: Grammar) {
-        let language = Rc::new(Language::Grammar(made));
-        let spoken = Spoken { at: at.to_string(), grammar: grammar.clone(), language };
+        let language = Rc::new(Language::Grammar(grammar));
+        let spoken = Spoken { at: String::new(), grammar: Parts::None, language };
         self.0.borrow_mut().insert(name.to_string(), spoken);
     }
 
@@ -137,7 +127,7 @@ impl Languages {
 
     pub fn get(&self, name: &str) -> Result<Rc<Language>, String> {
         match name {
-            "json" => Ok(Language::json()),
+            "json" => Ok(Rc::new(Language::Json)),
             _ => {
                 let spoken = self.0.borrow().get(name).map(|s| s.language.clone());
                 spoken.ok_or(format!("no language is called {name}"))
@@ -215,10 +205,6 @@ impl Shape {
         let named = items.iter().any(|g| matches!(g, Grammar::Part(..)) && !count(g));
         let others = items.iter().filter(|g| !mark(g) && !count(g)).count();
         Shape { kept: others > 0, lone: !named && others == 1, counts }
-    }
-
-    fn counts(&self, name: &str) -> bool {
-        self.counts.iter().any(|c| c == name)
     }
 }
 
@@ -650,7 +636,7 @@ impl Grammar {
                     }
                 }
                 items.iter().all(|g| match g {
-                    Grammar::Part(name, count) if shape.counts(name) => {
+                    Grammar::Part(name, count) if shape.counts.contains(name) => {
                         let len = lengths.iter().find(|(n, _)| n == name).map(|(_, l)| *l);
                         len.is_some_and(|len| count.write(&Parts::from(len as u64), true, w))
                     }
@@ -883,9 +869,10 @@ fn each(g: &Grammar, n: &Option<Count>, r: &mut Reader, at: &mut usize) -> Resul
 /// the part a piece's count names, if it names one
 fn counted_by(g: &Grammar) -> Option<&str> {
     match g {
-        Grammar::Part(_, g) => g.count_name(),
-        g => g.count_name(),
+        Grammar::Part(_, g) => g,
+        g => g,
     }
+    .count_name()
 }
 
 /// how long a part is, as a count counts it: its bytes, or its parts
@@ -910,13 +897,12 @@ impl Grammar {
             }
         }
         match self {
-            Grammar::Seq(items, _) => items.iter().enumerate().try_for_each(|(i, g)| match g {
-                Grammar::Part(_, g) => g.counts(Some(&items[..i])),
-                g => g.counts(Some(&items[..i])),
-            }),
+            Grammar::Seq(items, _) => {
+                items.iter().enumerate().try_for_each(|(i, g)| g.counts(Some(&items[..i])))
+            }
             Grammar::Choice(gs) => gs.iter().try_for_each(|g| g.counts(None)),
-            Grammar::Part(_, g)
-            | Grammar::Unless(g)
+            Grammar::Part(_, g) => g.counts(before),
+            Grammar::Unless(g)
             | Grammar::Be(g, _)
             | Grammar::Whole(g)
             | Grammar::Many(g, None)
@@ -1059,7 +1045,7 @@ mod tests {
         }
     }
 
-    /// kv as town says it in resident.lua
+    /// kv as town's own languages say it, in residents/languages/kv.lua
     fn kv() -> Grammar {
         grammar(json!({ "map": { "choice": [
             { "seq": [

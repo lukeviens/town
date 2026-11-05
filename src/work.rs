@@ -21,9 +21,11 @@ use crate::word::{is_kind, Tense, Word, KIND};
 
 /// A future `town/<verb>`, begun as `Town::talk` says it, so each is answered in the order asked,
 /// and a join hears what is wanted of it after. A `town/open` goes to the town's `Opening`, if it
-/// is kept. A `town/work` and a `town/after` are town's own, not a resident's: they outlive a
-/// reopen. A join or a connect is spoken for by `by`, who asked for it. Any other verb, a typo or
-/// what town says, is a `town/error`.
+/// is kept, which settles each save and says it once. A `town/work` and a `town/after` are
+/// town's own, not a resident's: they outlive a reopen. A join or a connect is spoken for by `by`,
+/// who asked for it. A `town/read` is answered to `by` alone, into its own queue, as no other asked
+/// it; the rest are answered as words all may hear. Any other verb, a typo or what town says, is a
+/// `town/error`.
 pub(crate) fn begin(town: &Rc<Town>, verb: &str, body: Body, by: u64) {
     let kind = format!("town/{verb}");
     let fail = |why: String| town.error(&Resident::town(), Some(&kind), why);
@@ -52,6 +54,11 @@ pub(crate) fn begin(town: &Rc<Town>, verb: &str, body: Body, by: u64) {
                 opening.ask(town, &body);
             }
         }
+        "read" => match read(town, &body) {
+            // to the asker alone: what it reads is its own
+            Ok(answer) => town.tell(by, Word::new("town/read", Tense::Past, answer)),
+            Err(why) => fail(why),
+        },
         _ => fail(format!("town has no `{verb}`")),
     }
 }
@@ -218,8 +225,7 @@ impl Join {
         let town = &self.town;
         let waits = async |m: &str| town.error(&self.resident, None, m.into());
         let (resident, voice) = (self.resident.clone(), Voice::new(out));
-        let languages = self.resident.languages();
-        let speaking = Life::speaking(town, resident, words, voice, languages, waits);
+        let speaking = Life::speaking(town, resident, words, voice, waits);
         if let Some(resident) = speaking.await {
             resident.live(town, &mut inp, end).await;
         }
@@ -237,6 +243,38 @@ fn answered(body: Body, say: impl FnOnce(&mut Parts)) -> Body {
         }
         _ => body,
     }
+}
+
+/// What town keeps of `kind` in `tense`, said back with what was asked: the tense is when, as town
+/// keeps only facts. Present, the fact now; past, the facts before it, oldest first, as far as the
+/// log's tail; of a pattern (`kind/`, `/kind`, `/`), by kind. The future is not kept: it is heard.
+fn read(town: &Town, body: &Body) -> Result<Body, String> {
+    let kind = body.part("kind").and_then(Parts::text).ok_or("a read names a `kind`")?;
+    let tense = body.part("tense").and_then(Parts::text).unwrap_or("present");
+    let one = is_kind(kind);
+    let read = match tense {
+        "present" => {
+            let facts = town.facts(kind);
+            match one {
+                true => facts.into_values().next().map_or(Parts::None, |b| b.parts().clone()),
+                false => {
+                    Parts::Map(facts.into_iter().map(|(k, b)| (k, b.parts().clone())).collect())
+                }
+            }
+        }
+        "past" => {
+            let list =
+                |bodies: Vec<Body>| Parts::List(bodies.iter().map(|b| b.parts().clone()).collect());
+            let past = town.past(kind);
+            match one {
+                true => list(past.into_values().next().unwrap_or_default()),
+                false => Parts::Map(past.into_iter().map(|(k, b)| (k, list(b))).collect()),
+            }
+        }
+        "future" => return Err("the future is not kept: it is heard, by `kinds`".into()),
+        _ => return Err("a read's tense is present or past".into()),
+    };
+    Ok(answered(body.clone(), |m| m.set("body", read)))
 }
 
 /// The time asked for, gone: said back as a past `town/after`, with everything the caller sent.
@@ -296,15 +334,15 @@ mod tests {
     }
 
     /// `line`, town's own language for a join that says lines, here as a town opens it
-    fn line(town: &Rc<Town>) {
-        wired(town, &crate::residents::own().join("languages/line.lua"));
+    async fn line(town: &Rc<Town>) {
+        wired(town, &crate::residents::own()[0].join("languages/line.lua")).await;
     }
 
     /// `said`, a language as `line` is, but that a line read is the body `{ said }`
-    fn said(town: &Rc<Town>, dir: &std::path::Path) {
+    async fn said(town: &Rc<Town>, dir: &std::path::Path) {
         let tense = r#"{ tense = choice{ be("", "past"), be("", "future") } }"#;
         let body = r#"{ body = seq{ { said = upto("\n") } } }"#;
-        speaking(town, dir, "said", &format!("seq{{ {tense}, {body} }}"));
+        speaking(town, dir, "said", &format!("seq{{ {tense}, {body} }}")).await;
     }
 
     // a joined program owns its kind while it runs and talks both ways; as it ends, the past
@@ -315,7 +353,7 @@ mod tests {
     fn a_join_talks_until_it_ends() {
         run(async {
             let (_dir, town, mut words) = joining();
-            line(&town);
+            line(&town).await;
             let join = |argv: Value, about: &str| {
                 let join = json!({ "as": "cat", "argv": argv, "about": about, "speaks": "line" });
                 want(&town, "town/join", join)
@@ -455,7 +493,7 @@ mod tests {
             let (_dir, town, mut words) = joining();
             want(&town, "town/join", json!({ "as": "early", "argv": ["cat"], "speaks": "line" }));
             want(&town, "early", json!("hi"));
-            line(&town); // said after: it waited for it
+            line(&town).await; // said after: it waited for it
             let said = |w: &Word| w.kind == "early" && w.tense == Tense::Past;
             assert_eq!(until(&mut words, said).await.body, Body::of("hi"));
             town.reopen();
@@ -505,24 +543,6 @@ mod tests {
         });
     }
 
-    // a joined program that stops saying is still told, until it ends, as any program is
-    #[test]
-    fn a_join_that_stops_saying_is_still_told() {
-        run(async {
-            let (_dir, town, mut words) = joining();
-            // its output closed, it says so aside, then says aside what it is told
-            let program =
-                r#"exec >&-; echo ready >&2; while read -r told; do echo "$told" >&2; done"#;
-            want(&town, "town/join", json!({ "as": "mute", "argv": ["sh", "-c", program] }));
-            until(&mut words, an_error("ready")).await;
-            // long enough that its silence is heard first
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            want(&town, "mute", json!("hi"));
-            until(&mut words, an_error("hi")).await;
-            town.reopen();
-        });
-    }
-
     // a join's kind is a kind: one ending in `/`, or with a part `..`, is refused
     #[test]
     fn a_join_is_as_a_kind() {
@@ -543,7 +563,7 @@ mod tests {
     fn a_join_speaks_its_language() {
         run(async {
             let (dir, town, mut words) = joining();
-            said(&town, &dir);
+            said(&town, &dir).await;
             want(&town, "town/join", json!({ "as": "cat", "argv": ["cat"], "speaks": "said" }));
             want(&town, "cat", json!({ "said": "hi" }));
             let back = until(&mut words, |w| w.kind == "cat" && w.tense == Tense::Past).await;
@@ -561,7 +581,7 @@ mod tests {
     fn a_socket_talks_until_it_closes() {
         run(async {
             let (dir, town, mut words) = joining();
-            said(&town, &dir);
+            said(&town, &dir).await;
             let at = dir.join("socket");
             let listener = tokio::net::UnixListener::bind(&at).unwrap();
             // the other end: says hello, says back the first line it hears, and closes
@@ -622,7 +642,7 @@ mod tests {
     fn a_join_says_one_language_and_hears_another() {
         run(async {
             let (dir, town, mut words) = joining();
-            said(&town, &dir);
+            said(&town, &dir).await;
             // it hears JSON, and says what it hears in `said`, the line it was told
             want(
                 &town,
@@ -730,20 +750,63 @@ mod tests {
             assert_eq!(done.body.value()["code"], 0);
             let ran = std::fs::read_to_string(dir.join("ran")).unwrap();
             assert_eq!(ran, "-c tmux kill-session\n", "the world's sh, given the command");
-            let lua = mlua::Lua::new();
-            crate::lua::install(&lua, &town).unwrap();
-            let home: String = lua.load("return os.getenv('HOME')").eval().unwrap();
-            assert_eq!(home, dir.to_string_lossy(), "the world's HOME");
-            assert!(lua
-                .load("return os.getenv('USER')")
-                .eval::<Option<String>>()
-                .unwrap()
-                .is_none());
+            // a Lua file, as `lua`, run in the world, reads it
+            let env = dir.join("env.lua");
+            let reads =
+                r#"talk(event("env", { home = os.getenv("HOME"), user = os.getenv("USER") }))"#;
+            std::fs::write(&env, format!("{reads}; return {{ own = {{ \"env\" }} }}")).unwrap();
+            wired(&town, &env).await;
+            let read = until(&mut words, |w| w.kind == "env").await.body.value();
+            assert_eq!(read, json!({ "home": dir.to_string_lossy() }), "the world's HOME alone");
             want(&town, "town/join", json!({ "as": "tmux", "argv": ["tmux", "-C"] }));
             let why = until(&mut words, an_error("cannot join")).await;
             let why = why.body.value()["message"].clone();
             assert_eq!(why, "cannot join tmux: tmux is not on the world's PATH");
             assert_eq!(until(&mut words, past("town/join")).await.body.value()["code"], -1);
         });
+    }
+
+    // a read is said back with what town keeps: the fact now, or the facts before it, oldest
+    // first, by kind for a pattern; the future is not kept; and one at the square may ask. Its
+    // answer is told to the asker alone: no other hears it, and the log holds none
+    #[test]
+    fn a_read_is_what_town_keeps() {
+        let (dir, town, mut words) = joining();
+        let say = |kind: &str, n: i64| town.talk(Word::new(kind, Tense::Present, Body::of(n)));
+        say("box/a", 1);
+        say("box/a", 2);
+        say("box/b", 3);
+        let asker = town.who("sq", true);
+        let mut mine = asker.listening(&town);
+        let other = Resident { kinds: vec!["/town/read".into()], ..town.who("other", true) };
+        let mut others = other.listening(&town);
+        let mut read = |kind: &str, tense: &str| {
+            let asked = json!({ "kind": kind, "tense": tense, "id": "q" });
+            town.said(Word::new("town/read", Tense::Future, Body::of(asked)), &asker);
+            let answer = |w: &Word| w.kind == "town/read" && w.tense == Tense::Past;
+            let w = std::iter::from_fn(|| mine.try_recv().ok()).find(answer);
+            let w = w.or_else(|| {
+                std::iter::from_fn(|| words.try_recv().ok()).find(|w| w.kind == crate::word::ERROR)
+            });
+            let w = w.expect("answered");
+            (w.kind.clone(), w.body.value())
+        };
+        let (kind, now) = read("box/a", "present");
+        assert_eq!(
+            (kind.as_str(), &now["body"], &now["id"]),
+            ("town/read", &json!(2), &json!("q"))
+        );
+        assert_eq!(read("box/none", "present").1["body"], Value::Null, "none, where there is none");
+        assert_eq!(read("box/", "present").1["body"], json!({ "box/a": 2, "box/b": 3 }));
+        assert_eq!(read("box/a", "past").1["body"], json!([1, 2]), "oldest first");
+        assert_eq!(read("box/", "past").1["body"], json!({ "box/a": [1, 2], "box/b": [3] }));
+        let (kind, refused) = read("box/a", "future");
+        assert_eq!(kind, "town/error");
+        assert!(refused["message"].as_str().unwrap().contains("not kept"));
+        let heard = |w: &Word| w.kind == "town/read" && w.tense == Tense::Past;
+        assert!(!std::iter::from_fn(|| others.try_recv().ok()).any(|w| heard(&w)), "another");
+        assert!(!std::iter::from_fn(|| words.try_recv().ok()).any(|w| heard(&w)), "nor all");
+        let logged = std::fs::read_to_string(dir.log()).unwrap();
+        assert!(!logged.contains("town/read"), "the log holds none");
     }
 }

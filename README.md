@@ -6,9 +6,9 @@ Everything is a word, and words are the entirety of how programs meet.
 For example, two programs that know nothing of each other, each in a terminal of its own:
 
 ```
-town ./residents          # a town, from a checkout of this repo
-town listen for theme     # a terminal, waiting to be coloured
-town talk theme bg=dark   # anything that decides the theme
+town ./residents ./target/release/lua   # a town, from a checkout of this repo
+town listen for theme                   # a terminal, waiting to be coloured
+town talk theme bg=dark                 # anything that decides the theme
 ```
 
 The listener hears, among the rest, `{"kind":"theme","tense":"present","body":{"bg":"dark"}}`, as
@@ -20,6 +20,16 @@ town talk <word>                        say a word, and go
 town listen [language] [for pattern…]   hear the words: the present, then each as it is said
 town ask <word>                         say a word, and wait for its answer
 ```
+
+- **a word** is a line of JSON, or said short: `[past|present|future] <kind> key=value …`, each
+  value text.
+- **`town talk`** says its word and exits, without waiting to hear whether town took it. It exits
+  1 if no town is at the square.
+- **`town ask`** says its word as given, with an `id`. An ask is future, `town ask future time`:
+  any other it refuses, and exits 2. Its answer is a past word of the same kind and `id`. It waits
+  `TOWN_WAIT` seconds, 1800 if unset, then exits 1, as it does when its word is refused or no town
+  is at the square.
+- **`town listen`** exits 1 if no town is at the square, and 2 for arguments it cannot read.
 
 ## words
 
@@ -54,274 +64,229 @@ nvim/     what is under nvim
 /         every kind but town/error
 ```
 
-`town/error` is heard only where it is named, `["/", "town/error"]`: hearing an error can make
-another, so errors heard by every resident could go on without end. So, too, when what one says
-while it hears an error, the last word it was told, is refused or is no word, town only prints it.
-
-On the command line:
-
-- **a word** is a line of JSON, or said short: `[past|present|future] <kind> key=value …`, each
-  value text.
-- **`town talk`** says its word and exits, without waiting to hear whether town took it. It exits
-  1 if no town is at the square.
-- **`town ask`** says its word as given, with an `id`. An ask is future, `town ask future time`:
-  any other it refuses, and exits 2. Its answer is a past word of the same kind and `id`. It waits
-  `TOWN_WAIT` seconds, 1800 if unset, then exits 1, as it does when its word is refused or no town
-  is at the square.
-- **`town listen`** exits 1 if no town is at the square, and 2 for arguments it cannot read.
-
-The log:
-
-- **what is kept**: each fact, in `past.log` in town's home (below), so a town started again has
-  the present it had.
-- **how far back**: `past(kind)` reads the log's last 128 KiB.
-- **not kept**: who is here, which is so only while town runs.
-
 ## residents
 
-A town is its residents. Anything that speaks to town is one, and all are the same:
-a file of Lua, a program, a join, a socket reached, one at the square.
+A town is its residents: whatever speaks to town. There are four ways in, and one door.
 
-- **opened**: a town is opened with paths, residents or folders of them, in order.
-- **in order**: a folder's own files are read, in name order, before its folders.
-- **libraries**: a Lua file that returns nothing is a library, for the files after it.
+- **a program**: a runnable file.
+- **a speaker's**: a file a speaker runs.
+- **a join**: a program or a socket, at a kind.
+- **at the square**: any program that reaches it.
 
-Each says first what it is, with these fields and no others:
+A town opens with paths: residents, or folders of them, in order. A folder's files are read in name
+order, then its folders.
+
+A resident's first word says what it is, with these fields and no others:
 
 ```
-kinds       what it hears, by patterns
-own         kinds only it may say facts and events of, while it is here; anyone may want them
-speaks      the language it speaks: JSON if it names none, or [says, hears]
+kinds       the patterns it hears
+own         the kinds only it may say facts and events of; anyone may want them
+speaks      its language, or [says, hears]; JSON if none
 languages   the languages it is: each name, and its grammar
 ```
 
-Town keeps what each resident is as a fact under `town/residents`:
+### a program
 
-- **while it is here**: its fact holds what it is, and its `id`, `name`, `at` and `square`.
-  As it goes, town says the fact of nothing there.
-- **its place**: where it lives. A file by its whole path,
-  `town/residents/Users/you/.config/town/hi.lua`; a join under the place of who asked for it,
-  `…/hi.lua/notes`, or by its kind, if town did; one at the square by its number, `square/<id>`.
-- **what it shows**: who owns what, and which languages are spoken. These facts are never logged.
-- **no fact**: a resident that hears, owns and is nothing has no fact.
-- **town itself**: number 0, here from the start.
-- **who is here**: `town listen for /town/residents`.
+A runnable file in the town's folders.
 
-A resident hears, in town's one order:
-
-1. the present of its kinds;
-2. `now`, a bodiless past word at `""`, the end of the present: each word after it is said as it
-   happens;
-3. each word of its kinds, its own among them.
-
-`now` is not told to a Lua resident, which hears within town, nor to one whose language cannot
-hold it, as `line` cannot.
-
-What a resident does:
-
-- **hearing**:
-  - never its own errors, those said as from it or one it speaks for, since one could make
-    another; but one at the square hears them, whatever it names, as it has no other way to know;
-  - within town, no word is missed;
-  - town keeps up to 1024 words waiting for one that stops reading; past that, it drops words, and
-    says so, once each time it falls behind;
-  - one slow to say what it is is told the present as it is when it says, so no fact it hears is
-    old; town says that it may have missed words between.
-- **saying**: words in its language, each of `kind`, `tense`, `body` and `when`, a whole number
-  town stamps over, each through town's one door, which checks that it may say it. It lasts while
-  it speaks: one that only listens keeps its end open, as `town listen` does.
-- **owning**:
-  - a kind has one owner, the first to own it, whatever pattern either names it by: one owns
-    `theme`, and another that would own `/theme` is refused;
-  - within an owned kind, the nearest owner says its own, if town runs it: a join at `box/cat` says
-    what is at `box/cat`, though one at `box` owns what is under `box`;
-  - one at the square owns nothing within another's, so none takes `box/cat` from that join; and
-    whichever came first: one at the square that owns `box/cat` keeps a join at `box` away;
-  - across an opening, what a resident town runs owned is held from the square until it comes
-    again, or will not, as a program says what it is only once it runs.
-- **town's own words**: the kinds under `town` (below), and intents for a joined kind, which are
-  told to the program town runs there: a future `tmux`, told to the join at `tmux`, is a command
-  tmux runs. Residents town runs may say and own them; one at the square may not.
-- **speaking for others**: a resident speaks for those under its place, so one program may be
-  many residents.
-  - A fact it says at `town/residents/<name>` is one under it: town places it at
-    `<its place>/<name>`, as it places a join's words under its kind. That is the one thing under
-    `town` any resident says, as it is its own place.
-  - Each is checked as any resident is when it comes, and stands where its speaker stands: inside,
-    or at the square.
-  - To say a word as one of them, it names which, `by`, beside the word and never part of it: a
-    word is its kind, tense, body and when.
-  - As it goes, they go.
-  - Only a program, or one at the square, speaks for others: a join's words are placed under its
-    kind, and a Lua resident's words have no `by`, so town refuses one it says.
-
-  ```
-  {"kind":"town/residents/theme.lua","body":{"own":["theme"]}}
-  {"kind":"theme","body":{"bg":"#000"},"by":"theme.lua"}
-  ```
-
-### in Lua
-
-A Lua resident is a table: what it is, and `listen(w)`, which answers with a word, or nil for
-none.
-
-```lua
--- ~/.config/town/hi.lua
-return react{
-  on("hello", function(w) return event("hi", { to = w.body.from }) end),
-}
-```
-
-```
-town talk past hello from=me   # town listen hears a hi
-```
-
-What a file talks as it is read is said once it has opened, in order: one that fails to open has
-done nothing.
-
-On a save, the resident saved goes and comes again, alone:
-
-- **across a save**: it keeps nothing but what the present holds.
-- **the others**: they stay as they are.
-- **what it joined**: goes with it, as all it speaks for does, and is joined again as it comes.
-- **what it asked**: a `town/work` or `town/after` is still answered, though not once town itself
-  starts again.
-- **a library**: a Lua file that is no resident is what the files after it are written with, each
-  its own copy: words, not a place to share things. A save of one opens the whole town again, as
-  does a save of a Lua file the town has not opened: one new, or one that failed.
-
-A resident is written with these, the same in every town:
-
-```
-fact(kind, body)  event(kind, body)  intent(kind, body)    a word in each tense
-on(what, act)                 a clause: a kind, or { kind, tense, by }; act(w) answers
-react{ on…, on… }             a resident from clauses: the first that matches answers; beside
-                              them, by name, `own` and `languages`
-present(kind)  past(kind)     a kind's fact now; its recent facts, oldest first; for `kind/`,
-                              `/kind` or `/`, those of each kind it names
-talk(word)                    say a word, besides answering
-work(cmd, body)               run a command without blocking: a future `town/work`, answered past
-after(ms, body)               wait without blocking: a future `town/after`, answered past
-join(kind, argv, body)        talk with a program, as kind: it says words there, and is told them,
-                              in the language `speaks` names: a future `town/join`, answered past
-                              as it ends
-connect(kind, to, body)       talk with a socket, a path or a host:port, as join does a program:
-                              a future `town/connect`, answered past as it ends
-TOWN                          town itself, for a program to call: `$TOWN talk …`
-read(path, as)                a file, read whole: text, or with `as`, the parts of that language
-post(path, body, as)          a file written whole, so a reader sees the old or the new
-mend(path, make, as)          a missing file, made from what make() returns
-parts(as, bytes)              bytes read in a language, as parts
-bytes(as, parts)              parts written in a language, as bytes
-quote(s)                      a string as one shell word, for a command
-```
-
-### as a program
-
-Any runnable file that is not Lua is a program town runs, wherever it is in the town's folders.
-
-- **what it is**: its first line of output says so, as any resident's does.
-- **once**: it runs once. Whether it fails or ends well, it stays ended until it is saved, or the
-  town opens again; one that fails says how it ended.
-- **where**: it runs in its own folder, and all it starts ends with it. As it goes, or the town
-  stops, it and all it started are killed, `SIGKILL`, at once.
-- **its errors**: each line it writes to stderr is a `town/error`, its first KiB.
-- **builds**: every runnable file in the town's folders is run, so keep a build, or anything that
-  acts as it starts, outside them, and link the program in.
+- **what it is**: its first line says so.
+- **once**: it runs once. Ended, well or not, it stays ended until it is saved or the town opens
+  again. One that fails says how it ended.
+- **where**: in its own folder. As it goes, or town stops, it and all it started are killed,
+  `SIGKILL`.
+- **its errors**: each line on stderr is a `town/error`, its first KiB.
+- **builds**: every runnable file in the town's folders is run. Keep builds outside them, and link
+  the program in.
 
 ```sh
 #!/bin/sh
-echo '{"kinds":["ping"]}'                      # and perhaps "own" and "speaks"
+echo '{"kinds":["ping"]}'
 while read -r w; do echo '{"kind":"pong","tense":"past"}'; done
 ```
 
-### at a kind
+### a speaker
 
-`join(kind, argv)` runs a program at a kind, and `connect(kind, to)` reaches a socket there.
+A program that runs files that cannot run themselves, and speaks for each: one program, many
+residents, each under its place. It:
 
-- **owns**: `kind` and what is under it.
-- **spoken for**: by the resident that asked for it, so it goes as that one goes. One whose asker
-  has no fact, as a program whose first line is `{}`, stands by its kind, spoken for by none, and
-  outlives its asker.
-- **told**: the facts at and under its kind, `now`, then each intent there.
-- **says**: facts and events.
-- **paths**: each kind is its path from `kind`: `a/b` is `kind/a/b`, and `""` is `kind`.
-- **errors**: an intent its language cannot hold is a `town/error`.
+1. **finds**: it hears `town/residents`, the paths town opened with, and takes its files.
+2. **says each**: a fact at `town/residents/<name>`, placed at `<its place>/<name>` and checked as
+   any resident's is. Each stands where its speaker stands, and its speaker is told what it hears.
+3. **speaks as each**: a word it says for one names it, `by`, beside the word, never in it.
+4. **says all is said**: a past `town/residents` with no body. Until then, what its residents
+   owned is held; then what one not said again owned is let go.
+5. **lets go**: a fact town refuses is the speaker's `town/error`, `heard` the kind it said,
+   `place` where that one would be. It is told so, though it hears none of its own errors.
 
-```lua
-join("tmux", { "tmux", "-C" }, { speaks = "line" })   -- each line a past word, each body a line
-join("notes", { "town-watch", file })   -- what a path holds, as facts, and again as it changes
+As it goes, they go.
+
+```
+{"kinds":["town/residents"]}
+{"kind":"town/residents/hi","body":{"kinds":["hello"]}}
+{"kind":"hi","tense":"past","body":{"to":"me"},"by":"hi"}
+{"kind":"town/residents","tense":"past"}
 ```
 
-`town-watch <path>` is town's own program, one like any other: see
-[`src/bin/town-watch.rs`](src/bin/town-watch.rs).
+`lua` is one: [`residents/lua`](residents/lua).
+
+### a join
+
+A program a resident asks town to run at a kind, `town/join`, or a socket to reach there,
+`town/connect`.
+
+- **owns**: its kind, and what is under it.
+- **spoken for**: by its asker, and goes as it goes. One whose asker has no fact, as a program
+  whose first line is `{}`, is spoken for by none, and outlives its asker.
+- **told**: the facts at and under its kind, `now`, then each want there: a future `tmux` is a
+  command for the join at `tmux`.
+- **says**: facts and events, by paths from its kind: `a/b` is `kind/a/b`, and `""` is `kind`.
+- **errors**: a want its language cannot hold is a `town/error`.
+
+A program that reads and writes lines joins unchanged:
+
+```lua
+join("tmux", { "tmux", "-C" }, { speaks = "line" })   -- each line a past word, its body the line
+join("notes", { WATCH, file })   -- what a path holds, as facts, and again as it changes
+```
+
+`watch` is one: [`residents/watch.rs`](residents/watch.rs).
 
 ### at the square
 
-`town listen`, `talk` and `ask` say what they are for you. Any other program says it itself, first:
+`town listen`, `talk` and `ask` say what they are for you. Any other program says it itself:
 `{"kinds":["/"]}` hears every kind but `town/error`, and talks; `{}` only talks.
+
+- **town's own**: it says and owns nothing under `town`, but may ask `town/read`, and wants
+  nothing of a joined kind.
+- **owning**: it owns nothing within another's; and one that owns `box/cat` keeps a join at `box`
+  away.
+- **errors**: it hears its own, and those of the ones it speaks for, whatever it names, as it has
+  no other way to know.
+
+### its fact
+
+While a resident is here, town keeps a fact of it at its place, under `town/residents`: what it
+is, and its `id`, `name`, `at` and `square`. As it goes, the fact is nothing.
+
+```
+a program           its whole path          town/residents/Users/you/bin/clock
+a speaker's         under its speaker's     town/residents/<speaker's place>/<name>
+a join              under its asker's       town/residents/<asker's place>/notes
+                    or, with none, its kind
+at the square       its number              town/residents/square/<id>
+```
+
+- **one place, one resident**: none comes where another is.
+- **none**: a resident that hears, owns and is nothing has no fact.
+- **town**: number 0, here from the start.
+- **who is here**: `town listen for /town/residents`.
+
+### hearing
+
+A resident is told, in order:
+
+1. the present of its kinds;
+2. `now`, a past word at `""` with no body: the present is told;
+3. each word of its kinds as it is said, its own too.
+
+- **`now`**: not told to a speaker's, or in a language that cannot hold it, as `line` cannot.
+- **errors**: `town/error` is heard only where it is named, `["/", "town/error"]`, as hearing an
+  error can make another. A resident never hears its own; a speaker hears those of the ones it
+  speaks for, each with its `place`. If what one says while it hears an error is refused, or no
+  word, town only prints it.
+- **none missed**: within town, no word is lost. For one that stops reading, town keeps 1024 words;
+  past that, it drops words, and says so once each time it falls behind.
+- **slow to come**: one slow to say what it is is told the present as it is then, and that it may
+  have missed words between.
+
+### saying
+
+- **a word**: its `kind`, `tense` and `body`, in its language. Town stamps `when`.
+- **the door**: every word comes through one door, which checks that its sayer may say it.
+- **while here**: a resident is here while its end is open. One that only listens keeps it open,
+  as `town listen` does.
+
+### owning
+
+- **one owner**: a kind has one, the first to own it, whatever pattern names it. One owns `theme`;
+  another that would own `/theme` is refused.
+- **the nearest**: within an owned kind, the nearest owner says its own. A join at `box/cat` says
+  what is there, though one at `box` owns what is under `box`.
+- **held**: across an opening, what a resident owned is held from the square until it comes again,
+  or will not.
 
 ## town
 
 Under `town` are town's own words: what it is, what it is asked, and what failed.
 
 ```
-town/residents          fact: the paths it was opened with; under it, each resident here
-town/work               future { cmd }: a command run; past: what it said, or why it could not
-                        start, how it ended, its ms
-town/after              future { ms }: a wait; past, once the ms have gone
-town/join               future { as, argv, speaks }: a program at a kind; past { code }, as it ends
-town/connect            future { as, to, speaks }: a socket at a kind; past { code }, as it ends
-town/open               future { path }: the resident there opened again, if it is one, or was
-town/error              past { from, heard, message }, and `said`, the first KiB of a line that was
-                        no word
+town/residents   fact: the paths it opened with; under it, each resident here
+                 past, no body: a speaker's all said
+town/work        future { cmd }: a command run; past: what it said, or why it could not start,
+                 how it ended, its ms
+town/after       future { ms }: a wait; past, once the ms have gone
+town/join        future { as, argv, speaks }: a program at a kind; past { code }, as it ends
+town/connect     future { as, to, speaks }: a socket at a kind; past { code }, as it ends
+town/open        future { path }: a file saved; past { paths }, once the save has settled, every
+                 file it touched: town opens its programs again, and a speaker those it runs
+town/read        future { kind, tense }: past { body }, what town keeps of it
+town/error       past { from, place, heard, message }, or `said`, the first KiB of what was no word
 ```
 
-- **answers**: each, past, carries the body it was asked with, its own parts added, so whoever
-  asked knows it for theirs.
+- **answers**: past, the body asked with its own parts added, so the asker knows it for its own.
+  A read's goes to the asker alone, and is not logged.
+- **reading**: present is the fact now; past, the facts before it, oldest first; a pattern gives
+  each kind. The future is not kept, so it is not read.
 - **refused**: any other future under `town`.
-- **watching**: town watches nothing itself. `reload` joins `town-watch` on each path it was
-  opened with but one inside another, which that one's watch holds, and asks `town/open` of each
-  file a watch says changed since it began, or is gone; town opens each once the opens one save
-  asks have stopped.
-- **its world**: the environment it starts in, each var and its value. Every process it starts
-  runs in it, a command's `sh`, a join, a program, found on its `PATH`, and a Lua resident reads
-  it with `os.getenv`. A test gives a town a world of its own, whose `sh` records what it is
-  given and runs none, and so sees what its residents would do.
+
+The log:
+
+- **what is kept**: each fact, in `past.log` in town's home (below), so a town started again has
+  the present it had.
+- **how far back**: a read of a kind's past reads the log's last 128 KiB.
+- **not kept**: who is here, which is so only while town runs.
+
+Its world is the environment it starts in: every process it starts runs in it, and is found on
+its `PATH`. Town adds `TOWN`, itself, and `WATCH`, its watch, beside it or in `libexec/town`; each
+as given, if it names a file. Its programs are not on `PATH`. A test gives a town a world of its
+own.
 
 ## languages
 
-A language is one grammar run both ways: it reads bytes as parts, and writes parts as bytes. Town
-speaks one itself, JSON: its log, its square, and every resident that names no other.
+Residents meet in words, but a program writes and reads bytes. A language is how its bytes are
+words: town reads what it writes as words, and writes each word it hears as bytes. So a program
+speaks as it already does: tmux in lines, a config in `key=value`, a fast one in msgpack.
 
-- **parts**: nothing, text, bytes, a number, true or false, a list, or parts by name.
-  - In Lua, a table is parts by name unless it is a list; `list{}` makes one a list, so an empty
-    one is said `[]`, not `{}`; and a nothing in a list is `null`, so the list keeps its places.
-  - JSON says bytes as a list of numbers.
-- **a stream**: a word is heard only once all of it has come.
-- **a resident**: a resident is a language if it says so, `languages = { kv = grammar }`. It is
-  spoken while that resident is here, and its grammar is in its fact.
-  - A name belongs to one resident: another that says it is `kv` is refused.
-  - A version is a name under it, `kv/2`.
-- **waiting**: a resident that speaks a language no resident is yet speaks JSON meanwhile, and town
-  says once that it waits. One at the square is told so.
-- **as it is now**: a language is spoken as its resident says it now: said again, another grammar,
-  what is said and told after is in that one; while none is it, what is said in it waits, and what
-  would be told in it is not.
+- **spoken**: a resident names the language it speaks, `speaks`, or two, `[says, hears]`. One that
+  names none speaks JSON, as town's log and square do.
+- **a grammar**: a language is one grammar, run both ways: it reads a word's parts, `kind`,
+  `tense`, `body` and `when`, from bytes, and writes them as bytes.
+- **a resident**: a language is a resident's, as all else is. One that says
+  `languages = { kv = grammar }` is `kv`: its grammar is in its fact, and `kv` is spoken while it
+  is here.
+  - **one name, one resident**: another that says it is `kv` is refused.
+  - **a version**: a name under it, `kv/2`.
+  - **said again**: what is said and told after is in its new grammar.
+- **waiting**: one that speaks a language no resident is speaks JSON meanwhile, and town says once
+  that it waits. What is said in it waits too, and nothing is told in it.
+- **parts**: nothing, text, bytes, a number, true or false, a list, or parts by name. JSON says
+  bytes as a list of numbers.
+- **a stream**: a word is heard once all of it has come.
+
+A grammar is made of these:
 
 ```
-upto(s)  but(s)               text up to s, which is passed over; text of one byte or more, up to
-                              the first byte in s
-seq{ … }  choice{ … }         each in turn, read as its named parts, or, with none, its one other
-                              piece; the first that reads
+upto(s)  but(s)               text up to s, which is passed over; text of a byte or more, none in s
+seq{ … }  choice{ … }         each in turn, as its named parts, or its one other piece; the first
+                              that reads
 many(g, n)  map(g, n)         as many as read, or n: in order; by the parts `key` and `value`
-unless(g)                     nothing, and only where g would not read
+unless(g)                     nothing, where g would not read
 int{ size, signed, order, from, to, base, negative }    a whole number of size bytes, the first
                               the most, or `order = "little"`, the least; `from` to `to` as held,
                               read less `base`, or, `negative`, `base` less it
 float{ size }                 a number of 2, 4 or 8 bytes
 text(n)  raw(n)               n bytes, as text or as they are
-whole(g)                      the text or bytes g reads in pieces, as one
+whole(g)                      what g reads in pieces, as one
 be(g, value)  ref(name)       what g reads, as value; the language of that name
 "bytes"  { name = g }         in a seq or a choice: those bytes; what g reads, by name
 ```
@@ -329,17 +294,17 @@ be(g, value)  ref(name)       what g reads, as value; the language of that name
 A count, `n`, is a number, a grammar that reads one, or the name of a part read before it in the
 same seq, which is then not kept. Written, it is the length of what it counts.
 
-Town's own are these, in [`residents/languages/`](residents/languages):
+Town's own, in [`residents/languages/`](residents/languages):
 
 ```
-words     a word a line, [tense] kind key=value …, a tab between each, as a shell says one
-line      a line of text, for a program that says lines
+words     a word a line: [tense] kind key=value …, a tab between each
+line      a line of text
 kv        lines of key=value
 msgpack   each value in its smallest form
 cbor      each value in its smallest form
 ```
 
-`kv`, for one:
+`kv`:
 
 ```lua
 local pair = seq{ { key = but("=\n") }, "=", { value = upto("\n") } }
@@ -348,16 +313,19 @@ return { languages = { kv = map(choice{ pair, upto("\n") }) } }
 
 ## town's own residents
 
-[`residents/`](residents) holds town's own residents: its languages, and `reload`, which opens a
-resident again as it is saved. Name them first:
+In [`residents/`](residents), each made as any other is:
 
-- **from a checkout**: `town ./residents ~/.config/town`.
-- **installed by nix**: they are in `share/town/residents`, beside town.
-- **from a crate**: one that depends on town, with its `testing` feature, finds them at
-  `town::residents::own()`.
+- **languages**: the five above.
+- **`reload`**: joins a `watch` on each path town opened with, but one inside another, and asks
+  `town/open` of each file that changes or goes.
+- **`lua`**: a speaker for Lua files, its own among them: [`residents/lua`](residents/lua).
+- **`watch`**: a program to join, `WATCH`: [`residents/watch.rs`](residents/watch.rs).
 
-[`examples/`](examples) is a small town of five residents that talk to each other: from a checkout,
-`town ./residents ./examples`.
+`lua` and `watch` are programs, built beside town. Name `residents/` and `lua` among a town's
+paths; town finds `watch` itself.
+
+[`examples/`](examples) is a small town of five residents that talk to each other:
+`town ./residents ./target/release/lua ./examples`.
 
 ## install
 
@@ -374,22 +342,22 @@ town.darwinModules.default
 })
 ```
 
-It runs as `system.primaryUser`, which your Mac's config must name. Elsewhere, keep `town
-./residents ~/.config/town` running, from a checkout, however you keep a program running.
+It runs as `system.primaryUser`, which your Mac's config must name. Elsewhere, keep
+`town ./residents ./target/release/lua ~/.config/town` running however you keep a program running.
 
-- **town's home**: the square and the log are in `~/.town`, private to you. It holds town's own
-  files, not residents: keep yours elsewhere, as `~/.config/town`.
-- **another**: `TOWN_HOME`, if it is set, for a second town or a test. Set it, too, for every
-  program that reaches the square, or it finds no town there.
+- **town's home**: `~/.town`, private to you, holds the square and the log. Keep your residents
+  elsewhere, as `~/.config/town`.
+- **another**: `TOWN_HOME`, for a second town or a test. Set it for every program that reaches the
+  square too.
 
 The town itself is yours to write.
 
 ## build
 
-Rust, with Lua 5.4 compiled in.
+Rust; `lua` has Lua 5.4 compiled in.
 
 ```
-cargo build --release   # → target/release/town, and town-watch beside it
+cargo build --release   # → target/release/town, and watch and lua beside it
 cargo test
 nix build               # the same
 ```

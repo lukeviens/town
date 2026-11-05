@@ -4,16 +4,17 @@
 # A resident can be any program, not only Lua. Its first line says what it hears, and how it
 # speaks: here in `words`, a word on a line, its tense, its kind, then key=value, a tab between
 # each, which a shell reads with nothing but `read`. It asks clock.lua the time as any resident
-# would: it says a future `time`, and listens for the past `time` that answers.
+# would: it says a future `time`, and listens for the past `time` that answers. It asks as it is
+# first told to shout, not as it starts: a want said before any hears it is heard by none.
 #
 #   town talk future shout text=hi     a past `shouted`, HI
-#   town listen                        a `shouting` fact: when it started
+#   town listen                        a `shouting` fact: when it first shouted
 
 tab=$(printf '\t')
 set -f   # a value of * is a star, not the files here
 
 echo '{"kinds":["shout","time"],"speaks":"words"}'
-printf 'future\ttime\tid=shout\n'
+asked=
 
 # the value of one key=value of the word just read
 field() { for p in $pairs; do case $p in "$1="*) printf '%s' "${p#*=}" ;; esac; done; }
@@ -24,6 +25,7 @@ while IFS=$tab read -r tense kind pairs; do
     past.time)
       [ "$(field id)" = shout ] && printf 'present\tshouting\tsince=%s\n' "$(field now)" ;;
     *.shout)
+      [ -n "$asked" ] || { asked=1; printf 'future\ttime\tid=shout\n'; }
       printf 'past\tshouted\ttext=%s\n' "$(field text | tr '[:lower:]' '[:upper:]')" ;;
   esac
 done
