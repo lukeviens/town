@@ -7,8 +7,8 @@
 # would: it says a future `time`, and listens for the past `time` that answers. It asks as it is
 # first told to shout, not as it starts: a want said before any hears it is heard by none.
 #
-#   town talk future shout text=hi     a past `shouted`, HI
-#   town listen                        a `shouting` fact: when it first shouted
+#   printf 'future\tshout\ttext=hi\n' | town '{"speaks":"words"}'   a past `shouted`, HI
+#   town '{"kinds":["shouting"]}'      held open: a `shouting` fact, when it first shouted
 
 tab=$(printf '\t')
 set -f   # a value of * is a star, not the files here

@@ -5,13 +5,10 @@
 //! - **each**: a file that can run is a program (`program`), whatever it is written in; one that
 //!   cannot, as a file of Lua, is a resident's to speak for, as `lua` speaks for each Lua file.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
-
-use tokio::time::Instant;
 
 use crate::body::Body;
 use crate::parts::Parts;
@@ -22,21 +19,21 @@ use crate::word::{Tense, Word};
 /// What a town opens first: its own residents, the `residents` folder in its crate, its languages
 /// and `reload` among them; then `lua`, town's own program that speaks for each Lua file, as built
 /// beside the one running, or above it, as a test runs in `deps/`, if it is built. Where nix
-/// installs town, `share/town/residents` holds `lua` beside the rest, and is one path.
+/// installs town, `share/town/residents` contains `lua` beside the rest, and is one path.
 #[cfg(any(test, feature = "testing"))]
 pub fn own() -> Vec<PathBuf> {
     let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("residents");
     let exe = std::env::current_exe().ok();
     let beside = exe.as_deref().and_then(Path::parent);
     let lua = beside.into_iter().flat_map(|at| [at.join("lua"), at.join("../lua")]);
-    let lua = lua.map(|l| whole(&l)).find(|l| crate::program::runs(l));
+    let lua = lua.map(|l| whole(&l)).find(|l| runs(l));
     [folder].into_iter().chain(lua).collect()
 }
 
 /// Open a town at once, for a test: end what ran before, say its paths, whole, at
 /// `town/residents`, and run its programs. Each, and the number of who it is.
 #[cfg(any(test, feature = "testing"))]
-pub fn open(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+pub fn open(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<Ran> {
     let paths: Vec<PathBuf> = paths.iter().map(|p| whole(p)).collect();
     town.reopen();
     say(town, &paths);
@@ -45,9 +42,9 @@ pub fn open(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<(PathBuf, u64)> {
 
 /// The whole town comes: each program of its paths runs, and what was held is held only for those
 /// yet to come. Each, and the number of who it is.
-fn all(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+fn all(town: &Rc<Town>, paths: &[PathBuf]) -> Vec<Ran> {
     let ran = comes(town, &files(paths, runs));
-    holding(town, &ran.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), |_| true);
+    holding(town, &ran.iter().map(|(f, ..)| f.clone()).collect::<Vec<_>>(), |_| true);
     ran
 }
 
@@ -81,15 +78,29 @@ fn spoken(town: &Town, kind: &str) -> bool {
     false
 }
 
-/// Each program of `files` runs, in order. Each, and the number of who it is.
+/// A program run: its file, the number of who it is, and the version of the file it ran.
+pub type Ran = (PathBuf, u64, Option<Version>);
+
+/// Which file a path is, and as it was last changed: the same until it is written, replaced or
+/// gone. Not when, but which.
+pub type Version = (u64, u64, i64, i64, u64);
+
+/// The version a path is now, through a link to what it leads to; none, if it is gone.
+pub fn version(path: &Path) -> Option<Version> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino(), m.ctime(), m.ctime_nsec(), m.size()))
+}
+
+/// Each program of `files` runs, in order. Each, the number of who it is, and the version it ran.
 /// Each is by its file's name, at its whole path.
-fn comes(town: &Rc<Town>, files: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+fn comes(town: &Rc<Town>, files: &[PathBuf]) -> Vec<Ran> {
     let mut ran = Vec::new();
     for path in files {
         let name = path.file_name().map_or("?".into(), |n| n.to_string_lossy().into_owned());
         let placed = whole(path).to_string_lossy().trim_start_matches('/').to_string();
         let it = Resident { placed: Some(placed), ..town.who(&name, false) };
-        ran.push((path.clone(), it.id));
+        ran.push((path.clone(), it.id, version(path)));
         town.runs(it.id, tokio::task::spawn_local(residing(town.clone(), it, path.clone())));
     }
     ran
@@ -105,16 +116,16 @@ pub(crate) fn under(kind: &str, at: &str) -> bool {
     kind.strip_prefix(at).is_some_and(|r| r.is_empty() || r.starts_with('/'))
 }
 
-/// Whether a file is one a walk finds: never a hidden file (`.git`, an editor's `.#lock`), nor an
-/// editor's backup (`name~`).
+/// Whether a file is one a walk finds: never a hidden file, as `.git` is. What else lies in a
+/// town's folders is its owner's to keep out.
 fn shown(path: &Path) -> bool {
     let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    !name.starts_with('.') && !name.ends_with('~')
+    !name.starts_with('.')
 }
 
 /// The files of a town that are `is`, in the order they open: each path as given; a folder's, as a
 /// `Walk` finds them, its own files before its folders, none hidden; each folder read once, though
-/// two paths hold it. A file named twice comes once, where it first comes. Town's are its
+/// two paths name it. A file named twice comes once, where it first comes. Town's are its
 /// programs (`program::runs`), wherever they are in its folders, so a build is kept outside them
 /// and its program linked in; a speaker's, those it runs.
 pub fn files(paths: &[PathBuf], is: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
@@ -122,7 +133,7 @@ pub fn files(paths: &[PathBuf], is: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     for p in paths {
         if p.is_dir() {
             walk.read(p, p, Path::new(""));
-            files.extend(walk.files.drain(..).map(|(f, ..)| f).filter(|f| shown(f) && is(f)));
+            files.extend(walk.files.drain(..).map(|(f, ..)| f).filter(|f| is(f)));
         } else if is(p) {
             files.push(p.clone());
         }
@@ -134,87 +145,59 @@ pub fn files(paths: &[PathBuf], is: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
 
 /// Open a town, and keep it to open again: say its paths, whole, at `town/residents`, and open.
 /// Its `Opening` answers a future `town/open` of a program (`work::begin`), asked by a resident
-/// that watches, as `reload` does.
+/// that mirrors its paths, as `reload` does.
 pub fn keep(town: &Rc<Town>, paths: Vec<PathBuf>) {
     let paths: Vec<PathBuf> = paths.iter().map(|p| whole(p)).collect();
     say(town, &paths);
-    let opening = Rc::new(Opening {
-        paths,
-        ran: Default::default(),
-        asked: Default::default(),
-        settling: Default::default(),
-    });
+    let opening = Rc::new(Opening { paths, ran: Default::default() });
     *town.opening.borrow_mut() = Some(opening.clone());
     opening.open(town);
 }
 
-/// What a town keeps to open again: its paths, each program it ran and the number of who it is,
-/// the files one save touched, and, while its opens come, when the last came and the most it
-/// waits. Town's own, so it outlives every opening.
+/// What a town keeps to open again: its paths, and each program it ran, the number of who it is,
+/// and the version it ran. Town's own, so it outlives every opening.
 pub struct Opening {
     paths: Vec<PathBuf>,
-    ran: RefCell<Vec<(PathBuf, u64)>>,
-    asked: RefCell<Vec<PathBuf>>,
-    settling: Cell<Option<(Instant, Instant)>>,
+    ran: RefCell<Vec<Ran>>,
 }
 
 impl Opening {
-    /// A future `town/open`: a save, of any file of the town. Its opens come a few ms apart, so it
-    /// is settled once none has come for `SETTLE`, or a second after the first, if they never stop;
-    /// every open meanwhile is of that save.
+    /// A future `town/open`: a save, of any file of the town, acted on as it comes.
+    /// Answered, as every ask is, by a past `town/open` of the body asked, and the `paths` of the
+    /// save: none, if what it names is no file of the town's, or is as it was.
     pub(crate) fn ask(self: &Rc<Self>, town: &Rc<Town>, body: &Body) {
-        let Some(path) = matters(body, &self.paths, &self.ran.borrow()) else { return };
-        let mut asked = self.asked.borrow_mut();
-        if !asked.contains(&path) {
-            asked.push(path);
-        }
-        drop(asked);
-        let now = Instant::now();
-        if let Some((_, most)) = self.settling.get() {
-            self.settling.set(Some((now, most)));
-            return;
-        }
-        self.settling.set(Some((now, now + Duration::from_secs(1))));
-        // town's own, so it outlives a reopen; holding the town weakly, so a town done is freed
-        let (me, town) = (self.clone(), Rc::downgrade(town));
-        tokio::task::spawn_local(async move {
-            while let Some((last, most)) = me.settling.get() {
-                let at = (last + SETTLE).min(most);
-                if Instant::now() >= at {
-                    break;
-                }
-                tokio::time::sleep_until(at).await;
-            }
-            me.settling.set(None);
-            let asked = me.asked.take();
-            if let Some(town) = town.upgrade() {
-                me.again(&town, &asked);
-            }
-        });
+        let asked: Vec<PathBuf> =
+            matters(body, &self.paths, &self.ran.borrow()).into_iter().collect();
+        // on a task of its own: the one that asks may be the one saved, whose run ends with it
+        let (me, town, body) = (self.clone(), town.clone(), body.clone());
+        tokio::task::spawn_local(async move { me.again(&town, body, &asked) });
     }
 
-    /// One save, settled: each program saved goes and comes again, alone, and one deleted goes;
-    /// then the save is said, a past `town/open` of every file it touched, so one that speaks for
-    /// files opens those it runs.
-    fn again(&self, town: &Rc<Town>, asked: &[PathBuf]) {
+    /// One save: each program saved goes and comes again, alone, and one deleted goes; one that
+    /// is still the version it ran stays, so asking again is nothing. Then the save is said, a past
+    /// `town/open` of every file it touched, so one that speaks for files opens those it runs.
+    fn again(&self, town: &Rc<Town>, body: Body, asked: &[PathBuf]) {
         let ran = self.ran.borrow().clone();
-        for path in asked {
-            if let Some((_, id)) = ran.iter().find(|(f, _)| f == path) {
+        let same =
+            |p: &PathBuf| ran.iter().any(|(f, _, v)| f == p && v.is_some() && *v == version(p));
+        let asked: Vec<PathBuf> = asked.iter().filter(|p| !same(p)).cloned().collect();
+        for path in &asked {
+            if let Some((_, id, _)) = ran.iter().find(|(f, ..)| f == path) {
                 town.leaves(&fact(path), *id);
             }
         }
         // what is there: one deleted only goes
         let coming: Vec<PathBuf> =
-            asked.iter().filter(|p| shown(p) && runs(p) && p.exists()).cloned().collect();
+            asked.iter().filter(|p| runs(p) && p.exists()).cloned().collect();
         let came = comes(town, &coming);
         holding(town, &coming, |kind| asked.iter().any(|p| under(kind, &fact(p))));
         let mut ran = self.ran.borrow_mut();
-        ran.retain(|(f, _)| !asked.contains(f));
+        ran.retain(|(f, ..)| !asked.contains(f));
         ran.extend(came);
         drop(ran);
-        let paths = asked.iter().map(|p| p.to_string_lossy().as_ref().into()).collect();
-        let saved = Parts::map([("paths", Parts::List(paths))]);
-        town.talk(Word::new("town/open", Tense::Past, Body::of(saved)));
+        let paths: Vec<Parts> = asked.iter().map(|p| p.to_string_lossy().as_ref().into()).collect();
+        let saved = crate::work::answered(body, |m| m.set("paths", Parts::List(paths)));
+        town.talk(Word::new("town/open", Tense::Past, saved));
     }
 
     /// The whole town opens again: all that ran ends; then each program runs, and hears the paths,
@@ -243,23 +226,20 @@ pub fn whole(path: &Path) -> PathBuf {
 
 /// The file a `town/open` asks to open, whole, if it matters: one of the town's, at or in one of
 /// its `paths` and nothing hidden on the way, as a walk finds them; or a program it `ran`.
-fn matters(body: &Body, paths: &[PathBuf], ran: &[(PathBuf, u64)]) -> Option<PathBuf> {
+fn matters(body: &Body, paths: &[PathBuf], ran: &[Ran]) -> Option<PathBuf> {
     let path = whole(Path::new(body.part("path").and_then(Parts::text)?));
     let within = |at: &PathBuf| {
         let inside = path.strip_prefix(at).ok();
         inside.is_some_and(|i| i.components().all(|c| shown(Path::new(c.as_os_str()))))
     };
-    let mine = shown(&path) && paths.iter().any(within);
-    (mine || ran.iter().any(|(f, _)| *f == path)).then_some(path)
+    let mine = paths.iter().any(within);
+    (mine || ran.iter().any(|(f, ..)| *f == path)).then_some(path)
 }
 
-/// How quiet a save must fall before what it saved opens again.
-const SETTLE: Duration = Duration::from_millis(50);
-
-/// A walk of folders, as a town reads its residents and a watch what it holds: each file, however
-/// deep, a folder's own files in name order, then its folders; nothing hidden. A link is followed,
-/// but not into the walk itself, so each file is found once, where it truly is, and each folder is
-/// read once.
+/// A walk of folders, as a town reads its residents and a mirror what it contains: each file,
+/// however deep, a folder's own files in name order, then its folders; nothing hidden. A link is
+/// followed, but not into the walk itself, so each file is found once, where it truly is, and each
+/// folder is read once.
 #[derive(Default)]
 pub struct Walk {
     /// each file found: where it is, as it was reached; its name in the walk; what it is
@@ -280,9 +260,12 @@ impl Walk {
             false => meta,
             true => match (path.canonicalize(), std::fs::metadata(path)) {
                 (Ok(to), Ok(meta)) => {
-                    let inside = root.canonicalize().is_ok_and(|r| to.starts_with(r));
-                    if !name.as_os_str().is_empty() && inside {
-                        return; // found where it truly is
+                    // found where it truly is, unless that is hidden, where none looks
+                    let root = root.canonicalize().ok();
+                    let within = root.as_ref().and_then(|r| to.strip_prefix(r).ok());
+                    let seen = |inner: &Path| inner.components().all(|c| shown(Path::new(&c)));
+                    if !name.as_os_str().is_empty() && within.is_some_and(seen) {
+                        return;
                     }
                     if meta.is_dir() && self.folders.contains(&to) {
                         return; // read already, where it was first found
@@ -330,8 +313,7 @@ fn nearest(link: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 pub(crate) mod inside {
     use super::*;
-    use crate::program::LAST;
-    use crate::testing::{an_error, quiet, run, scratch, until, Scratch};
+    use crate::testing::{an_error, guard, run, scratch, script, until, Scratch};
     use crate::town::Listening;
 
     /// `lua`, town's own program for its Lua files, as built: `cargo test` builds it.
@@ -383,18 +365,9 @@ pub(crate) mod inside {
         wired(town, &path).await;
     }
 
-    /// a shell script in `dir`, a program town may run
-    pub(crate) fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
     // a folder's own files come before its folders; a program, however deep, whatever it is
     // written in; a linked folder read like any other, once, so a link back up ends; no hidden file
-    // or folder, no backup, nothing that cannot run, as a Lua file that cannot
+    // or folder, nothing that cannot run, as a Lua file that cannot
     #[test]
     fn a_folder_reads_its_files_then_its_folders() {
         let dir = scratch();
@@ -406,8 +379,7 @@ pub(crate) mod inside {
             std::fs::write(top.join(f), "").unwrap();
         }
         script(&top, "run", "");
-        script(&top, "run~", ""); // an editor's backup
-        script(&top, ".#run", ""); // an editor's lock
+        script(&top, ".#run", ""); // hidden, as an editor's lock is
         script(&top.join(".git"), "hidden", "");
         script(&top.join("apps"), "deep", "");
         script(&top.join("apps"), "runs.lua", ""); // a Lua file that runs itself
@@ -425,10 +397,18 @@ pub(crate) mod inside {
         assert_eq!(names(twice), ["apps/deep", "run", "apps/runs.lua", "b-linked/linked"]);
         assert!(files(&[top.join("lib.lua")], runs).is_empty(), "a file named that cannot run");
         assert!(files(&[top.join("none")], runs).is_empty(), "nor one not there");
+        // a link to one where none looks, in a hidden folder of the town, is read where it is
+        // linked; and one named by itself is read, though hidden
+        let hook = script(&top.join(".git"), "hook", "");
+        std::os::unix::fs::symlink(&hook, top.join("hooked")).unwrap();
+        let hooked = ["hooked", "run", "apps/deep", "apps/runs.lua", "b-linked/linked"];
+        assert_eq!(names(files(std::slice::from_ref(&top), runs)), hooked);
+        let named = files(std::slice::from_ref(&hook), runs);
+        assert_eq!(named, std::slice::from_ref(&hook), "named by itself");
     }
 
-    // an open matters to any file of the town, however deep, gone or not: not to an editor's
-    // backup or lock, one in a hidden folder, or one outside the town; a program the town ran
+    // an open matters to any file of the town, however deep, gone or not: not to a hidden one, or
+    // one in a hidden folder, or one outside the town; a program the town ran
     // matters, wherever it is; and an open names a path
     #[test]
     fn only_an_open_of_a_towns_file_matters() {
@@ -436,13 +416,16 @@ pub(crate) mod inside {
         let top = dir.join("town");
         std::fs::create_dir_all(top.join("apps")).unwrap();
         let away = script(&dir, "away", "");
-        let (paths, ran) = (vec![whole(&top)], vec![(whole(&away), 0)]);
+        let (paths, ran) = (vec![whole(&top)], vec![(whole(&away), 0, None)]);
         let changed = |path: &Path| matters(&asked(path), &paths, &ran).is_some();
         assert!(changed(&top.join("apps/a.lua")), "a file of the town, however deep");
         assert!(changed(&top.join("gone")), "gone or not");
-        assert!(!changed(&top.join("run~")) && !changed(&top.join(".#lock")), "a backup, a lock");
+        assert!(!changed(&top.join(".#lock")), "a hidden one");
         assert!(!changed(&top.join(".git/config")), "one in a hidden folder");
         assert!(!changed(&dir.join("elsewhere")), "one outside the town");
+        let hidden = whole(&dir.join(".named"));
+        let named = |path: &Path| matters(&asked(path), std::slice::from_ref(&hidden), &ran);
+        assert!(named(&hidden).is_some(), "a hidden file named itself, as it opens");
         assert!(changed(&away), "a program it ran, wherever it is");
         assert!(matters(&Body::none(), &paths, &ran).is_none(), "an open names a path");
     }
@@ -465,27 +448,50 @@ pub(crate) mod inside {
         assert!(files(&own[..1], runs).is_empty(), "the folder holds no program: {own:?}");
     }
 
+    /// `path` saved as it is: written again, so it is not the one opened
+    fn saves(path: &Path) {
+        std::fs::write(path, std::fs::read(path).unwrap()).unwrap();
+    }
+
     /// an open of `path`, as a resident asks it
     fn asked(path: &Path) -> Body {
         Body::of(Parts::map([("path", path.to_string_lossy().as_ref())]))
     }
 
     /// a Lua file that says it opened, as `lua` reads it, so each opening is heard, however soon
-    /// the next; and a town kept from `lua` and `top`, heard from before it opens
+    /// the next; one that answers a ping, so what `lua` did before it is known to be done; and a
+    /// town kept from `lua` and `top`, heard from before it opens
     async fn kept(dir: &Scratch, top: &Path) -> (Rc<Town>, Listening) {
         std::fs::create_dir_all(top).unwrap();
         std::fs::write(top.join("opens.lua"), r#"talk(event("opened"))"#).unwrap();
+        let pongs = r#"return react { on("ping", function() return event("pong") end) }"#;
+        std::fs::write(top.join("pongs.lua"), pongs).unwrap();
         let town = Town::with_log(dir.log());
         let mut words = town.words.listen();
         keep(&town, vec![lua(), top.join(".")]);
         until(&mut words, |w| w.kind == "opened").await;
+        // what hears a ping is here, so one is heard
+        let pongs = lua_fact(&top.join("pongs.lua"));
+        if !town.facts(&pongs).contains_key(&pongs) {
+            until(&mut words, |w| w.kind == pongs && !w.body.is_none()).await;
+        }
         (town, words)
     }
 
-    /// whether the town's Lua opens again within a while
-    async fn opens(words: &mut Listening) -> bool {
-        let again = until(words, |w| w.kind == "opened");
-        tokio::time::timeout(Duration::from_millis(300), again).await.is_ok()
+    /// the save just asked, said by town
+    async fn saved(words: &mut Listening) {
+        until(words, |w| w.kind == "town/open" && w.tense == Tense::Past).await;
+    }
+
+    /// How often the town's Lua has opened since it was last asked: `lua` reads in order, so all
+    /// it opened for what it heard before a ping is said before the pong
+    async fn opened(town: &Town, words: &mut Listening) -> usize {
+        town.talk(Word::new("ping", Tense::Past, Body::none()));
+        let mut opened = 0;
+        while until(words, |w| w.kind == "opened" || w.kind == "pong").await.kind == "opened" {
+            opened += 1;
+        }
+        opened
     }
 
     // a town says the paths it is opened with, whole, at `town/residents`, and opens once
@@ -495,15 +501,15 @@ pub(crate) mod inside {
             let dir = scratch();
             let top = dir.join("town");
             let (town, mut words) = kept(&dir, &top).await;
-            assert!(!opens(&mut words).await, "opened once");
+            assert_eq!(opened(&town, &mut words).await, 0, "opened once");
             let paths = town.facts(RESIDENTS).remove(RESIDENTS).unwrap();
             assert_eq!(paths.value(), serde_json::json!([lua(), top]), "the paths, whole");
             town.reopen();
         });
     }
 
-    // a town done is freed: its programs and their joins do not hold it, so once what runs for it
-    // ends and it is dropped, it is gone
+    // a town done is freed: its programs and their joins do not keep it alive, so once what runs
+    // for it ends and it is dropped, it is gone
     #[test]
     fn a_town_done_is_freed() {
         run(async {
@@ -527,10 +533,13 @@ pub(crate) mod inside {
             let gone = Rc::downgrade(&town);
             end(&town);
             drop((town, words));
-            for _ in 0..16 {
-                tokio::task::yield_now().await;
-            }
-            assert!(gone.upgrade().is_none(), "freed");
+            // what it ended lets go as it is next run: nothing waits on a program
+            guard(async {
+                while gone.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
         });
     }
 
@@ -541,7 +550,7 @@ pub(crate) mod inside {
     fn what_a_program_owned_is_held_as_the_town_opens_again() {
         run(async {
             let dir = scratch();
-            let themer = r#"sleep 0.1; echo '{"own":["theme"]}'; exec sleep 60"#;
+            let themer = r#"echo '{"own":["theme"]}'; while read -r _; do :; done"#;
             let themer = script(&dir, "themer", themer);
             let gone = dir.join("gone.lua");
             std::fs::write(&gone, r#"return { own = { "gone" } }"#).unwrap();
@@ -556,15 +565,19 @@ pub(crate) mod inside {
             let owns = |own: &str| Resident { own: vec![own.into()], ..town.who("square", true) };
             assert!(town.come(&owns("theme")).is_err(), "held, before it says what it is");
             assert!(town.come(&owns("gone")).is_err(), "held, before lua says what it is");
-            // let go as lua says all it speaks for is said, once it has opened its files
-            let free = async {
-                while town.come(&owns("gone")).is_err() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            // lua says all it speaks for is said, once it has opened its files, and themer says
+            // what it is, in either order
+            let all = |w: &Word| w.kind == fact(&lua()) && w.tense == Tense::Past;
+            let (mut said, mut again) = (false, false);
+            while !(said && again) {
+                let w = until(&mut words, |w| all(w) || came(w)).await;
+                if all(&w) {
+                    said = true;
+                    assert!(town.come(&owns("gone")).is_ok(), "a Lua file gone: let go");
+                } else {
+                    again = true;
                 }
-            };
-            let free = tokio::time::timeout(Duration::from_secs(5), free).await;
-            assert!(free.is_ok(), "a Lua file gone: let go");
-            until(&mut words, came).await;
+            }
             assert!(town.come(&owns("theme")).is_err(), "its own again");
             town.reopen();
         });
@@ -583,8 +596,9 @@ pub(crate) mod inside {
             let open = |path: &Path| town.talk(Word::new("town/open", Tense::Future, asked(path)));
             std::fs::write(top.join("README.md"), "").unwrap();
             open(&top.join("README.md"));
-            assert!(!opens(&mut words).await, "no resident");
-            let new = r#"echo '{"own":["mine"]}'; echo '{"kind":"new"}'; exec cat"#;
+            saved(&mut words).await;
+            assert_eq!(opened(&town, &mut words).await, 0, "no resident");
+            let new = r#"echo '{"own":["mine"]}'; echo '{"kind":"new","tense":"past"}'; exec cat"#;
             let new = script(&top, "new", new);
             open(&new);
             let said = until(&mut words, |w| w.kind == "town/open" && w.tense == Tense::Past);
@@ -594,16 +608,19 @@ pub(crate) mod inside {
                 "the save, said"
             );
             until(&mut words, |w| w.kind == "new").await;
-            assert!(!opens(&mut words).await, "a new file comes, alone");
+            assert_eq!(opened(&town, &mut words).await, 0, "a new file comes, alone");
             let id = |kind: &str| town.facts(kind).remove(kind).map(|b| b.value()["id"].clone());
             let was = id(&fact(&new));
-            (0..5).for_each(|_| open(&top.join("opens.lua")));
-            assert!(opens(&mut words).await && !opens(&mut words).await, "once, for one save");
+            saves(&top.join("opens.lua"));
+            open(&top.join("opens.lua"));
+            saved(&mut words).await;
+            assert_eq!(opened(&town, &mut words).await, 1, "once, for one save");
             assert!(was.is_some() && id(&fact(&new)) == was, "a program stays as it is");
             std::fs::remove_file(&new).unwrap();
             open(&new);
             until(&mut words, |w| w.kind == fact(&new) && w.body.is_none()).await;
-            assert!(!opens(&mut words).await, "a resident deleted goes, alone");
+            saved(&mut words).await;
+            assert_eq!(opened(&town, &mut words).await, 0, "a resident deleted goes, alone");
             town.reopen();
         });
     }
@@ -631,12 +648,13 @@ pub(crate) mod inside {
             let (was, its, others) = (id(&lua_fact(&a)), id(&cat), id(&lua_fact(&b)));
             assert!(town.joins.borrow().contains_key("cat"), "joined, under the one that asked");
 
+            saves(&a);
             open(&a);
             until(&mut words, |w| w.kind == cat && w.body.is_none()).await;
             until(&mut words, joined).await;
             assert!(id(&lua_fact(&a)) != was && id(&cat) != its, "it, and its join, come again");
             assert_eq!(id(&lua_fact(&b)), others, "the others stay");
-            assert!(!opens(&mut words).await, "no more opens");
+            assert_eq!(opened(&town, &mut words).await, 0, "no more opens");
 
             std::fs::remove_file(&a).unwrap();
             open(&a);
@@ -652,22 +670,95 @@ pub(crate) mod inside {
         });
     }
 
+    // a program is opened again only when its file is not the one it ran: asked of the same, it
+    // stays, so a mirror may ask of all it contains; saved, it comes again
+    #[test]
+    fn a_program_opens_again_only_when_it_is_not_the_one_it_ran() {
+        run(async {
+            let dir = scratch();
+            let top = dir.join("town");
+            std::fs::create_dir_all(&top).unwrap();
+            let it = script(&top, "it", r#"echo '{"own":["it"]}'; while read -r _; do :; done"#);
+            let town = Town::with_log(dir.log());
+            let mut words = town.words.listen();
+            keep(&town, vec![top.clone()]);
+            let came = |w: &Word| w.kind == fact(&it) && !w.body.is_none();
+            let id = |w: Word| w.body.value()["id"].as_u64().unwrap();
+            let first = id(until(&mut words, came).await);
+            let open = || town.talk(Word::new("town/open", Tense::Future, asked(&it)));
+            open();
+            // answered as any ask is, with what it asked, and nothing saved
+            let mut q = asked(&it).parts().clone();
+            q.set("id", "q1");
+            town.talk(Word::new("town/open", Tense::Future, Body::of(q)));
+            let answer = |w: &Word| w.kind == "town/open" && w.tense == Tense::Past;
+            let answer = |w: &Word| answer(w) && w.body.value()["id"] == "q1";
+            let answer = until(&mut words, answer).await.body.value();
+            assert_eq!(answer["paths"], serde_json::json!([]), "nothing saved: {answer}");
+            std::fs::write(
+                &it,
+                "#!/bin/sh\necho '{\"own\":[\"it\"]}'; while read -r _; do :; done\n",
+            )
+            .unwrap();
+            open();
+            let again = id(until(&mut words, came).await);
+            let ids: Vec<u64> = town.tasks.borrow().iter().map(|(id, _)| *id).collect();
+            assert!(again != first && ids == [again], "the same stays; saved, it comes: {ids:?}");
+            town.reopen();
+        });
+    }
+
+    // a program that asks that its own file open again goes, all that runs for it with it, and
+    // comes again: the one asking is the one that ends
+    #[test]
+    fn a_program_that_asks_itself_open_again_goes() {
+        run(async {
+            let dir = scratch();
+            let top = dir.join("town");
+            std::fs::create_dir_all(&top).unwrap();
+            let me = top.join("me");
+            let once = top.join(".asked");
+            let ask = format!(
+                r#"{{"kind":"town/open","tense":"future","body":{{"path":"{}"}}}}"#,
+                me.display()
+            );
+            let says = format!(
+                r#"echo '{{"own":["me"]}}'; echo '{{"kind":"ran","tense":"past"}}'
+                [ -e {once} ] || {{ : > {once}; touch "$0"; echo '{ask}'; }}
+                while read -r _; do :; done"#,
+                once = once.display(),
+            );
+            script(&top, "me", &says);
+            let town = Town::with_log(dir.log());
+            let mut words = town.words.listen();
+            keep(&town, vec![top.clone()]);
+            let came = |w: &Word| w.kind == fact(&me) && !w.body.is_none();
+            let id = |w: Word| w.body.value()["id"].as_u64().unwrap();
+            let first = id(until(&mut words, came).await);
+            let again = id(until(&mut words, came).await);
+            until(&mut words, |w| w.kind == "ran").await;
+            let ids: Vec<u64> = town.tasks.borrow().iter().map(|(id, _)| *id).collect();
+            assert!(first != again && ids == [again], "the first ended: {ids:?}");
+            town.reopen();
+        });
+    }
+
     // a program with a fact is heard to its last line, though it goes as it ends: its going ends
     // what runs for it, but not the run that goes, which hears what is left of its stderr
     #[test]
     fn a_program_that_goes_is_heard_to_its_end() {
         run(async {
             let dir = scratch();
-            // a job of its own group, which outlives it, says a line once it has gone
+            // a job of its own group, which outlives it, says a line once it has gone, and town
+            // has heard it go
             let late = r#"echo '{"own":["late"]}'; set -m
-                (sleep 0.2; echo late >&2) >/dev/null & exit 3"#;
+                (while kill -0 $$ 2>/dev/null; do :; done; echo late >&2) >/dev/null & exit 3"#;
             let late = script(&dir, "late", late);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
             open(&town, std::slice::from_ref(&late));
             until(&mut words, |w| w.kind == fact(&late) && w.body.is_none()).await;
-            let heard = until(&mut words, an_error("late"));
-            assert!(tokio::time::timeout(LAST, heard).await.is_ok(), "its last line");
+            until(&mut words, an_error("late")).await;
             town.reopen();
         });
     }
@@ -681,18 +772,20 @@ pub(crate) mod inside {
             let joins = dir.join("joins.lua");
             std::fs::write(&joins, r#"talk(join("cat", { "cat" })); return { own = { "a" } }"#)
                 .unwrap();
-            let mute = script(&dir, "mute", "exec sleep 60");
+            let mute = script(&dir, "mute", "while read -r _; do :; done");
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();
             let ran = open(&town, &[lua(), joins.clone(), mute.clone()]);
             let cat = format!("{}/cat", lua_fact(&joins));
             until(&mut words, |w| w.kind == cat && !w.body.is_none()).await;
-            for (path, id) in &ran {
+            for (path, id, _) in &ran {
                 town.leaves(&fact(path), *id);
             }
-            let said = quiet(&mut words).await;
-            let nothing =
-                |at: &str| said.iter().filter(|w| w.kind == at && w.body.is_none()).count();
+            // each going says its nothings as it goes: all are said
+            let said: Vec<Word> = std::iter::from_fn(|| words.try_recv().ok()).collect();
+            let nothing = |at: &str| {
+                said.iter().filter(|w| w.kind == at && w.is_fact() && w.body.is_none()).count()
+            };
             let once = (nothing(&fact(&lua())), nothing(&lua_fact(&joins)), nothing(&cat));
             assert_eq!(once, (1, 1, 1), "once each");
             assert_eq!(nothing(&fact(&mute)), 0, "none where none was");
@@ -712,11 +805,11 @@ pub(crate) mod inside {
             let was = r#"echo '{"own":["p"]}'
                 echo '{"kind":"town/join","tense":"future","body":{"as":"cat","argv":["cat"]}}'
                 echo '{"kind":"town/residents/sub","body":{"own":["subs"]}}'
-                exec sleep 60"#;
+                while read -r _; do :; done"#;
             let is = r#"echo '{"own":["p"]}'
-                echo '{"kind":"town/residents","tense":"past"}'
+                echo '{"kind":"","tense":"past"}'
                 echo '{"kind":"up","tense":"past"}'
-                exec sleep 60"#;
+                while read -r _; do :; done"#;
             let p = script(&top, "p", was);
             let town = Town::with_log(dir.log());
             let mut words = town.words.listen();

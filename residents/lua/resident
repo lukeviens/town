@@ -7,16 +7,8 @@ function intent(kind, body) return { kind = kind, tense = "future",  body = body
 function fact(kind, body)   return { kind = kind, tense = "present", body = body } end
 function event(kind, body)  return { kind = kind, tense = "past",    body = body } end
 
--- languages: a grammar, run both ways, reads bytes as parts and writes parts as bytes; what has
--- not all come yet is waited for. The README's *languages*.
---
--- - in a `seq` or a `choice`: a string is those bytes; `{ name = g }` names what g reads; a string
---   named is kept.
--- - a seq: the parts named within it; with none, what its one other piece reads.
--- - a resident that is one says so, `{ languages = { kv = grammar } }`, and it is spoken while it
---   is here; a version is a name under it, `kv/2`.
--- - `parts(name, bytes)` reads with one, `bytes(name, parts)` writes, and so does `as` on the
---   files.
+-- languages: grammars, as town's README's *languages* reads them. `parts(name, bytes)` reads with
+-- one, `bytes(name, parts)` writes, and so does `as` on the files.
 -- each piece is marked as one, so `{ name = g }` is a part whatever its name: `text`, `map`, `int`
 local piece = {}
 local function made(t) return setmetatable(t, piece) end
@@ -41,7 +33,8 @@ function many(g, n)   return made{ many = counted(g, n) } end -- as many as read
 function map(g, n)    return made{ map = counted(g, n) } end  -- the same, by `key`: each a `value`
 function unless(g)    return made{ unless = item(g) } end     -- nothing, where g would not read
 -- a whole number: { size = bytes, signed, order = "big"|"little", from, to, base, negative }, from
--- and to bounding what the bytes hold, and read as that less base; or, negative, as base less that
+-- and to bounding what the bytes contain, and read as that less base; or, negative, as base less
+-- that
 function int(o)       return made{ int = o or {} } end
 function float(o)     return made{ float = o or {} } end      -- { size = 2|4|8, order }
 -- a count, n, is a number; a piece that reads one; or the name of a part read before it in the
@@ -66,7 +59,9 @@ function post(path, body, as)
   if as then body = bytes(as, body) end
   local aside = path .. ".writing"
   local f, e = io.open(aside, "wb"); if not f then error("post: " .. e, 2) end
-  local wrote, e = f:write(body); f:close()
+  local wrote, e = f:write(body)
+  local closed, ce = f:close()   -- a full disk may fail only as it closes
+  if wrote and not closed then wrote, e = nil, ce end
   if wrote then wrote, e = os.rename(aside, path) end
   if not wrote then os.remove(aside); error("post: " .. e, 2) end
 end
@@ -82,9 +77,10 @@ local function copy(body)
   local b = {}; for k, v in pairs(body or {}) do b[k] = v end; return b
 end
 
--- work: run a command without blocking the town. A past `town/work` comes back with `code`,
--- `out`, `ms` and what was sent, to match with `on`'s `by`. `where` is the line that asked, for
--- timing.
+-- work: run a program, `argv` as given, without blocking the town: `{ "date" }`; a shell is a
+-- program, `{ "sh", "-c", cmd }`; a wait is one too, `{ "sleep", "2" }`. A past `town/work` comes
+-- back with `code`, `out`, `ms` and what was sent, to match with `on`'s `by`. `where`, the file and
+-- line that asked, rides along, so work's cost can be told by where it was asked.
 local acting   -- the clause react is running
 
 -- where work was asked: the line that called it, or, when `return work(…)` (a tail call) took that
@@ -100,44 +96,22 @@ local function asked()
   return src and (src .. ":" .. (line or i.currentline)) or "?"
 end
 
-function work(cmd, body)
+function work(argv, body)
+  local whole = type(argv) == "table" and #argv > 0
+  for _, a in ipairs(whole and argv or {}) do whole = whole and type(a) == "string" end
+  if not whole then error("work: argv is a list of strings, the program first", 2) end
   local b = copy(body)
-  b.cmd = cmd
+  b.argv = argv
   b.where = asked()
   return intent("town/work", b)
 end
 
--- after: a wait that blocks nothing. Once `ms` have gone, a past `town/after` comes back with what
--- was sent. A wait is the town's: it is answered across a save, not across town starting again.
-function after(ms, body)
-  if type(ms) ~= "number" or ms ~= ms or ms < 0 or ms == math.huge then   -- nan is not itself
-    error("after: ms must be a number, 0 or more", 2)   -- the asker's line, the asker's error
-  end
-  local b = copy(body)
-  b.ms = ms
-  return intent("town/after", b)
-end
-
--- join: run a program as a resident at `kind`. Town's README's *a join*.
---
--- - owns: `kind`, and what is under it.
--- - told: the facts there, then `now`, then each word wanted there; it says what is and what was.
--- - paths: its kinds are from `kind`: `a/b` is `kind/a/b`, and none is `kind`.
--- - speaks: `speaks`, or JSON.
--- - ends: a past `town/join` carries its `code` and what was sent. Joining a kind again ends the
---   one before, as a reopen does.
+-- join: run a program as a resident at `kind`, as town's README's *a join* reads; a past
+-- `town/join` carries its `code` and what was sent.
 function join(kind, argv, body)
   local b = copy(body)
   b.as, b.argv = kind, argv
   return intent("town/join", b)
-end
-
--- connect: reach a socket, `to` a path or a host:port, as `join` runs a program. As it ends, a
--- past `town/connect` carries what was sent.
-function connect(kind, to, body)
-  local b = copy(body)
-  b.as, b.to = kind, to
-  return intent("town/connect", b)
 end
 
 -- on: a clause: match a word, then run act(w).
@@ -171,10 +145,10 @@ function on(what, act)
   }
 end
 
--- react: a resident from `on` clauses, and what else it is, `kinds`, `own` and `languages`, by name
--- beside them. Its `kinds` are the clauses' kinds and those it names besides; or every kind ("/")
--- if a clause names none, and `town/error` too if one names it. Its `listen` runs the first
--- matching clause.
+-- react: a resident from `on` clauses, and what else it is, `kinds`, `own`, `languages` and
+-- `names`, by name beside them. Its `kinds` are the clauses' kinds and those it names besides; or
+-- every kind ("/") if a clause names none, and `town/error` too if one names it; but those it
+-- `except`s. Its `listen` runs the first matching clause.
 function react(list)
   local kinds, seen, all = {}, {}, false
   local function hear(kind)
@@ -187,8 +161,10 @@ function react(list)
   if all then kinds = seen["town/error"] and { "/", "town/error" } or { "/" } end
   return {
     kinds = kinds,
+    except = list.except,
     own = list.own,
     languages = list.languages,
+    names = list.names,
     listen = function(w)
       for _, c in ipairs(list) do
         if c.match(w) then

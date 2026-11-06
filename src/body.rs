@@ -1,4 +1,4 @@
-//! A body: what a word holds.
+//! A body: what a word contains.
 //!
 //! - **parts**: read only when one is asked for; till then, the JSON it was said in.
 //! - **written**: as JSON, it goes on as it came; another language writes its parts anew.
@@ -40,7 +40,7 @@ impl Body {
     pub fn parts(&self) -> &Parts {
         self.0.parts.get_or_init(|| {
             let bytes = self.0.said.as_ref().expect("a body is parts, or said");
-            serde_json::from_slice(bytes).unwrap_or_default()
+            crate::parts::json(bytes).unwrap_or_default()
         })
     }
 
@@ -56,6 +56,11 @@ impl Body {
             Some(bytes) => bytes.trim_ascii() == b"null",
             _ => self.parts().is_none(),
         }
+    }
+
+    /// Whether it was said and cannot be read: nothing as parts, though not said as nothing.
+    fn unread(&self) -> bool {
+        self.parts().is_none() && !self.is_none()
     }
 
     /// the whole body, to look into in a test
@@ -81,7 +86,14 @@ impl fmt::Debug for Body {
 
 impl PartialEq for Body {
     fn eq(&self, other: &Body) -> bool {
-        self.parts() == other.parts()
+        // the same bytes are the same parts, unread
+        if let (Some(a), Some(b)) = (&self.0.said, &other.0.said) {
+            if a == b {
+                return true;
+            }
+        }
+        // one that cannot be read is the same only as the same bytes, above
+        !self.unread() && !other.unread() && self.parts() == other.parts()
     }
 }
 
@@ -101,6 +113,14 @@ impl PartialEq<Parts> for Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // two that cannot be read are the same only as the same bytes: neither is nothing
+    #[test]
+    fn what_cannot_be_read_is_itself() {
+        let (a, b) = (Body::said(&b"{\"n\":1e400}"[..]), Body::said(&b"[2e999]"[..]));
+        assert!(a != b && a == Body::said(&b"{\"n\":1e400}"[..]));
+        assert!(a != Body::none() && Body::said(&b"null"[..]) == Body::none());
+    }
 
     // a body said in JSON is read only when asked, and written as it came; one of parts, anew
     #[test]

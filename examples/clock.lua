@@ -1,16 +1,17 @@
 -- clock: ask it the time, and it runs `date` and tells you.
 --
--- `work` runs a command without making the town wait. The result comes back later as a past
--- `town/work`, with whatever you sent along, and `by` picks out clock's own. Each time is kept as a
--- fact: `present` gives the last one, `past` the ones before. If the question has an `id`, the
--- answer goes back as a past `time` with that `id`.
+-- `work` runs a program, `date` here, without making the town wait. The result comes back later as
+-- a past `town/work`, with whatever you sent along, and `by` picks out clock's own. Each time is
+-- kept as a fact: `present` gives the last one, `past` them all. If the question has an
+-- `id`, the answer goes back as a past `time` with that `id`.
 --
---   town talk future time       a new `clock` fact
---   town ask future time        the time, as an answer
+--   printf 'future\ttime\n' | town '{"speaks":"words"}'        a new `clock` fact
+--   town '{"kinds":["time"]}'                               held open: the answer to a `time`
+--                                                           with an `id`, as a past `time`
 
 return react{
   on({ kind = "time", tense = "future" }, function(w)
-    return work("date " .. quote("+%H:%M:%S"), { about = "clock", id = (w.body or {}).id })
+    return work({ "date", "+%H:%M:%S" }, { about = "clock", id = (w.body or {}).id })
   end),
 
   on({ kind = "town/work", tense = "past", by = { about = "clock" } }, function(w)

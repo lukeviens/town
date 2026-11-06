@@ -1,31 +1,24 @@
-//! lua: town's own resident that speaks for each Lua file in the paths town opens with. A Lua file
-//! cannot run itself, so this one runs it, and says its words for it. Its README is beside it.
+//! lua: a speaker for Lua files, which cannot run themselves. Its README is beside it.
 //!
-//! - **finds**: the `.lua` files of `town/residents` that cannot run themselves, in town's order.
-//! - **speaks for**: each, said at `town/residents/<its path>`, so under this one's place; each of
-//!   its words names it, `by`.
-//! - **hears**: what its files hear, which town tells it as they come, and passes each word to each
-//!   file that hears it. What a file reads, a kind's present or its past, lua reads from town
-//!   (`town/read`): town is the one that knows, and lua keeps no copy.
-//! - **again**: a file saved goes and comes again alone, as town says a save settled (a past
-//!   `town/open`). A library, which the files after it are written with, and a file not opened,
-//!   one new or one that failed, open them all again, in a new Lua.
-//! - **a word**: a table. A part is nil, a string, a number, a boolean, or a table: a list if its
-//!   keys are 1 to n, else parts by name. A nothing in a list is `null`, so the list keeps its
-//!   places.
+//! - **speaks for**: each `.lua` file of `town/residents`, at `town/residents/<its path>`, `by` it.
+//! - **hears**: each word town tells it `by` a file, handed to that file. What a file reads, lua
+//!   reads from town (`town/read`), and keeps no copy.
+//! - **again**: a file saved, as a past `town/open` names it, comes again alone; a library, or a
+//!   file not opened, opens them all again, in a new Lua.
+//! - **a word**: a table. A list is a table keyed 1 to n, and a nothing in one is `null`.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
 
 use mlua::{Function, Lua, Table, Value};
 use town::body::Body;
-use town::language::{Languages, DEEP};
+use town::language::{Language, Languages};
 use town::parts::Parts;
+use town::residents::{version, Version};
 use town::word::{hears, is_kind, place, Tense, Word};
 
 /// How a resident is written, read into each file before it.
@@ -36,9 +29,6 @@ const RESIDENTS: &str = "town/residents";
 
 /// Where the mark a list carries is kept.
 const LIST: &str = "town.list";
-
-/// How long a file waits for town to answer a read, before it is the file's error.
-const READ: Duration = Duration::from_secs(5);
 
 fn main() {
     // what it is: what tells it its files, and what asks it to open one again; town tells it what
@@ -57,31 +47,28 @@ fn main() {
     loop {
         // what came as a file read from town, first, in the order it came
         let aside = me.here.aside.borrow_mut().pop_front();
-        if let Some((w, read)) = aside {
-            me.heard(w, read);
+        if let Some((w, by)) = aside {
+            me.heard(w, by);
             continue;
         }
         let line = me.here.heard.borrow().as_ref().map(|rx| rx.recv());
         // town hung up: nothing more to hear, nor to say to
         let Some(Ok(line)) = line else { return };
-        if let Ok(w) = town::voice::read(&line) {
-            me.heard(w, None);
+        if let Ok((w, by)) = town::voice::said(&line) {
+            me.heard(w, by);
         }
     }
 }
 
 /// What every Lua it makes looks through: the languages, and where it says and hears its words.
-/// Each Lua's windows hold it, so it is shared.
+/// Each Lua's windows keep it, so it is shared.
 #[derive(Default)]
 struct Here {
     languages: Languages,
     /// what town tells it, a line at a time; and what came while a file waited for a read, set
     /// aside to be heard next, in order
     heard: RefCell<Option<mpsc::Receiver<String>>>,
-    aside: RefCell<std::collections::VecDeque<(Word, Option<u64>)>>,
-    /// the file, by when it came, whose present is being read as it comes: a fact set aside
-    /// meanwhile is in what it reads, so it is not told it again
-    reading: std::cell::Cell<Option<u64>>,
+    aside: RefCell<std::collections::VecDeque<(Word, Option<String>)>>,
     reads: std::cell::Cell<u64>,
 }
 
@@ -97,39 +84,30 @@ impl Here {
         let heard = self.heard.borrow();
         let rx = heard.as_ref().ok_or_else(|| mlua::Error::runtime("town is not here to read"))?;
         loop {
-            let line = rx.recv_timeout(READ).map_err(|_| {
-                mlua::Error::runtime(format!("town did not answer a read of {kind}"))
-            })?;
-            let Ok(w) = town::voice::read(&line) else { continue };
-            let ours = w.kind == "town/read" && w.tense == Tense::Past;
+            // town answers each read; one gone answers none, and its end is lua's
+            let line = rx.recv().map_err(|_| mlua::Error::runtime("town is gone"))?;
+            let Ok((w, by)) = town::voice::said(&line) else { continue };
+            let ours = w.kind == "town/read" && w.tense == Tense::Past && by.is_none();
             if ours && w.body.part("id").and_then(Parts::text) == Some(id.as_str()) {
                 return Ok(w.body.part("body").cloned().unwrap_or_default());
             }
-            let reading = self.reading.get().filter(|_| w.tense == Tense::Present);
-            self.aside.borrow_mut().push_back((w, reading));
+            self.aside.borrow_mut().push_back((w, by));
         }
     }
 
     /// A word, said: by the file named `by`, if one says it, or by lua itself.
     fn say(&self, w: &Word, by: Option<&str>) {
-        let mut line = town::voice::line(w);
-        if let Some(by) = by {
-            line.pop();
-            line.push_str(&format!(r#","by":{}}}"#, serde_json::Value::from(by)));
-        }
+        let line = town::voice::bytes(w, by, &Language::Json, &self.languages);
         let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+        let _ = out.write_all(&line.unwrap_or_default()).and_then(|()| out.flush());
     }
 }
 
-/// A file it speaks for: its name, which is its whole path but the first `/`, its kinds, its
-/// `listen`, and its place to run in.
+/// A file it speaks for: its path; its name, which is its whole path but the first `/`; and its
+/// `listen`.
 struct File {
     path: PathBuf,
     name: String,
-    /// when it came, in the order files come: one that came hearing a word is not told it too
-    came: u64,
-    kinds: Vec<String>,
     listen: Option<Function>,
 }
 
@@ -142,7 +120,8 @@ enum Came {
 }
 
 /// lua itself: what it shares with its Lua, the paths, the Lua it runs its files in, each file it
-/// read and what it came as, and the residents among them, each with when it came.
+/// read and what it came as, the residents among them, and, while one save is read, what its
+/// libraries talked, said once their read stands; and which version of each file it read.
 #[derive(Default)]
 struct Me {
     here: Rc<Here>,
@@ -150,47 +129,48 @@ struct Me {
     lua: RefCell<Option<Lua>>,
     ran: RefCell<Vec<(PathBuf, Came)>>,
     files: RefCell<Vec<File>>,
-    /// how many files have come; and how many had, as this batch of them began to
-    came: std::cell::Cell<u64>,
-    batch: std::cell::Cell<u64>,
+    told: RefCell<Option<Vec<Word>>>,
+    read: RefCell<HashMap<PathBuf, Version>>,
 }
 
 impl Me {
     /// What failed: a `town/error` from `from`, by the file of that name if it came, hearing
-    /// `heard` if a word was in hand. One of a file, town tells back, with its `place`, as it tells
-    /// every error of one lua speaks for (`heard`); one of lua's own it does not, so lua tells it
-    /// to each of its files that hears it.
+    /// `heard` if a word was in hand; `answering`, if that word was an error, so none answers it.
     fn failed(&self, from: &str, by: Option<&str>, heard: Option<&str>, message: String) {
         let mut body = Parts::map([("from", from), ("message", message.as_str())]);
         if let Some(heard) = heard {
             body.set("heard", heard);
+            if heard == "town/error" {
+                body.set("answering", true);
+            }
         }
-        let error = Word::new("town/error", Tense::Past, Body::of(body));
-        self.here.say(&error, by);
-        if by.is_none() {
-            self.tell(&error, None, self.came.get(), None);
-        }
+        self.here.say(&Word::new("town/error", Tense::Past, Body::of(body)), by);
     }
 
-    /// A word heard: the paths open every file again; a save is asked; a resident's fact tells the
-    /// languages it is; and each file that hears it is told it. Not `now`: within it, each hears
-    /// the present first.
-    fn heard(&self, w: Word, read: Option<u64>) {
-        if w.is_now() {
+    /// A word heard. One `by` a file is that file's: its greeting's `now`, after which it has said
+    /// each fact it has, or a word it hears. One by none is lua's own: the paths open every file
+    /// again; a save is asked; a resident's fact tells the languages it is; a fact of a file
+    /// refused drops it.
+    fn heard(&self, w: Word, by: Option<String>) {
+        if let Some(name) = by {
+            // its greeting's `now`, said back for it: a file hears in turn, each word to its end
+            // before the next, so all it was told before is heard by then
+            if w.is_now() {
+                return self.here.say(&w, Some(&name));
+            }
+            let listen =
+                self.files.borrow().iter().find(|f| f.name == name).map(|f| f.listen.clone());
+            let lua = self.lua.borrow().clone();
+            if let (Some(Some(listen)), Some(lua)) = (listen, lua) {
+                self.listen(&lua, &name, &listen, &w);
+            }
             return;
         }
-        // those that come as it is heard were greeted with the present, which holds it: not told it
-        let before = self.came.get();
-        // the languages a resident is, from its fact, so a file may read and write them
         if w.tense == Tense::Present && w.kind.starts_with(&format!("{RESIDENTS}/")) {
             self.here.languages.are(&w.kind, &spoken(&w.body));
         }
-        // an error of one of its files is told to the rest, not to it: by its place, under lua's
-        let mut of = (w.kind == "town/error").then(|| self.of(&w.body)).flatten();
-        // a file whose fact town refused is dropped, and the refusal told to the rest
         if let Some(refused) = self.refused(&w) {
             self.drop_file(&refused);
-            of = Some(refused);
         }
         if w.kind == RESIDENTS && w.tense == Tense::Present {
             let paths = w.body.parts().list().into_iter().flatten();
@@ -202,17 +182,6 @@ impl Me {
             let saved: Vec<PathBuf> = paths.filter_map(Parts::text).map(PathBuf::from).collect();
             self.saved(&saved);
         }
-        // what it read is only what lua heard before it came: the rest, town tells it now
-        let read = read.filter(|_| self.heard_before(&w.kind));
-        self.tell(&w, of.as_deref(), before, read);
-    }
-
-    /// The name of the file an error is of, by its `place`, which ends in it.
-    fn of(&self, body: &Body) -> Option<String> {
-        let place = body.part("place").and_then(Parts::text)?;
-        let files = self.files.borrow();
-        let of = files.iter().find(|f| place.ends_with(&format!("/{}", f.name)));
-        of.map(|f| f.name.clone())
     }
 
     /// The name of a file whose fact town refused, if this error says so: what it heard is the
@@ -232,33 +201,15 @@ impl Me {
         let gone: Vec<File> = self.files.borrow_mut().extract_if(.., |f| f.name == name).collect();
         let mut ran = self.ran.borrow_mut();
         for file in &gone {
-            self.here.languages.are(&mine(&file.name), &[]);
+            self.here.languages.are(&languages_of(&file.name), &[]);
             if let Some(came) = ran.iter_mut().find(|(p, _)| *p == file.path) {
                 came.1 = Came::Failed;
             }
         }
     }
 
-    /// Each file that hears `w` is told it, in the order they came, but the one it is `of`, those
-    /// that came after the `before`th, and the one that `read` it as it came.
-    fn tell(&self, w: &Word, of: Option<&str>, before: u64, read: Option<u64>) {
-        let hearing: Vec<(String, Function)> = self
-            .files
-            .borrow()
-            .iter()
-            .filter(|f| f.came <= before && Some(f.name.as_str()) != of && Some(f.came) != read)
-            .filter(|f| f.kinds.iter().any(|k| hears(k, &w.kind)))
-            .filter_map(|f| f.listen.clone().map(|l| (f.name.clone(), l)))
-            .collect();
-        let Some(lua) = self.lua.borrow().clone() else { return };
-        for (name, listen) in hearing {
-            self.listen(&lua, &name, &listen, w);
-        }
-    }
-
     /// A file listens to a word, and whatever it answers is said as its: a word, or nil for none. A
-    /// Lua error, or an answer that is no word, is a `town/error` from it, but one it made hearing
-    /// a `town/error`, which is not said: two that hear them would make each other's without end.
+    /// Lua error, or an answer that is no word, is a `town/error` from it.
     fn listen(&self, lua: &Lua, name: &str, listen: &Function, w: &Word) {
         let said = to_lua(lua, &town::voice::parts(w)).and_then(|t| listen.call::<Value>(t));
         let said = said.map(|said| (!said.is_nil()).then(|| to_word(said)));
@@ -268,25 +219,25 @@ impl Me {
             Ok(Some(Err(e))) => format!("answered with a non-word: {e}"),
             Err(e) => e.to_string(),
         };
-        if w.kind != "town/error" {
-            self.failed(named(name), Some(name), Some(&w.kind), failed);
-        }
+        self.failed(named(name), Some(name), Some(&w.kind), failed);
     }
 
-    /// What one save touched, as town says it once the save settles: of those files, the ones it
-    /// read, or its walk finds now, open again.
+    /// What one save touched, as town says it: of those files, the ones it read, or its walk finds
+    /// now, open again, but one that is the version it read, which is as it was.
     fn saved(&self, paths: &[PathBuf]) {
         let found = lua_files(&self.paths.borrow());
         let ran = self.ran.borrow().clone();
         let mine = |p: &PathBuf| found.contains(p) || ran.iter().any(|(f, _)| f == p);
-        let asked: Vec<PathBuf> = paths.iter().filter(|p| mine(p)).cloned().collect();
+        let read = self.read.borrow().clone();
+        let changed = |p: &PathBuf| version(p).is_none() || version(p) != read.get(p).copied();
+        let asked: Vec<PathBuf> = paths.iter().filter(|p| mine(p) && changed(p)).cloned().collect();
         if !asked.is_empty() {
             self.again(&asked);
         }
     }
 
     /// Every file it speaks for goes, and each of the paths' Lua files comes, in a new Lua, so a
-    /// resident keeps nothing but what the present holds.
+    /// resident keeps nothing but what is in the present.
     fn open(&self) {
         for file in self.files.take() {
             self.leaves(&file);
@@ -300,7 +251,7 @@ impl Me {
         let files = lua_files(&self.paths.borrow());
         let ran = self.comes(&lua, &files);
         *self.ran.borrow_mut() = ran;
-        self.said();
+        self.now();
     }
 
     /// What one save asked: each file it speaks for goes and comes again, alone; one deleted only
@@ -323,50 +274,45 @@ impl Me {
         // one deleted only goes, as does one that runs now: town runs it, as a program
         let coming: Vec<PathBuf> =
             asked.iter().filter(|p| p.exists() && !town::program::runs(p)).cloned().collect();
+        *self.told.borrow_mut() = Some(Vec::new());
         let came = self.comes(&lua, &coming);
+        let told = self.told.take().unwrap_or_default();
         let library = came.iter().any(|(_, c)| *c == Came::Library);
         let mut ran = self.ran.borrow_mut();
         ran.retain(|(f, _)| !asked.contains(f));
         ran.extend(came);
         drop(ran);
-        // one that is a library now: the files after it are written with it
+        // one that is a library now: the files after it are written with it, and it is read again
+        // with them, so what it talked here is not said
         if library {
             return self.open();
         }
-        self.said();
+        for w in told {
+            self.here.say(&w, None);
+        }
+        self.now();
     }
 
-    /// All it speaks for is said: what those that went owned, held while they came again, is let
-    /// go now, of those that did not.
-    fn said(&self) {
-        self.here.say(&Word::new(RESIDENTS, Tense::Past, Body::none()), None);
+    /// All it speaks for is said, `now`: what those that went owned, held while they came again,
+    /// is let go, of those that did not. Each file says its own once it has its present.
+    fn now(&self) {
+        self.here.say(&Word::now(), None);
     }
 
     /// A file it spoke for goes: said so, at its place; and the languages it was, no longer spoken.
     fn leaves(&self, file: &File) {
         let kind = format!("{RESIDENTS}/{}", file.name);
         self.here.say(&Word::new(kind, Tense::Present, Body::none()), None);
-        self.here.languages.are(&mine(&file.name), &[]);
-    }
-
-    /// Whether lua heard `kind` before the file now coming: its own kinds, or another file's.
-    /// One of this batch is not counted: town tells lua what it newly hears as each comes, and lua
-    /// passes that on to all of the batch, the file now coming among them.
-    fn heard_before(&self, kind: &str) -> bool {
-        let own = [format!("/{RESIDENTS}"), "town/open".into()];
-        let files = self.files.borrow();
-        let before = files.iter().filter(|f| f.came <= self.batch.get());
-        own.iter().chain(before.flat_map(|f| f.kinds.iter())).any(|k| hears(k, kind))
+        self.here.languages.are(&languages_of(&file.name), &[]);
     }
 
     /// Each of `files` comes, in order. What failed is said last, once each listens, so one may
     /// hear it. Each file, and what it came as.
     fn comes(&self, lua: &Lua, files: &[PathBuf]) -> Vec<(PathBuf, Came)> {
-        self.batch.set(self.came.get());
         let mut failed = Vec::new();
         let mut ran = Vec::new();
         for path in files {
-            match self.wire(lua, path) {
+            match self.load(lua, path) {
                 Ok(came) => ran.push((path.clone(), came)),
                 Err(e) => {
                     failed.push((named(&name(path)).to_string(), e.to_string()));
@@ -381,9 +327,13 @@ impl Me {
     }
 
     /// A file, read in its own place (`place`). A resident is said at `town/residents/<its name>`,
-    /// so under lua's place; then what it talked as it was read; then the present of its kinds.
-    /// One that fails has done nothing.
-    fn wire(&self, lua: &Lua, path: &Path) -> mlua::Result<Came> {
+    /// so under lua's place; then what it talked as it was read. One that fails has done nothing.
+    fn load(&self, lua: &Lua, path: &Path) -> mlua::Result<Came> {
+        // its version before it is read: one saved as it is read is another, and opens again
+        match version(path) {
+            Some(v) => self.read.borrow_mut().insert(path.to_path_buf(), v),
+            None => self.read.borrow_mut().remove(path),
+        };
         let src = std::fs::read_to_string(path)?;
         let name = name(path);
         let held: Held = Rc::new(RefCell::new(Some(Vec::new())));
@@ -392,19 +342,23 @@ impl Me {
             lua.load(src.as_str()).set_name(named(&name)).set_environment(env).eval()?;
         let Some(it) = it else {
             // a library: words for the files after it, each of which reads it into its own place.
-            // What it talked as it was read is said, by lua, as it is no resident to say it
+            // What it talked as it was read is said by lua, as it is no resident to say it, once
+            // its read stands
             libraries(lua)?.push(lua.create_sequence_from([named(&name).to_string(), src])?)?;
-            for w in held.take().unwrap_or_default() {
-                self.here.say(&w, None);
+            let words = held.take().unwrap_or_default();
+            match self.told.borrow_mut().as_mut() {
+                Some(told) => told.extend(words),
+                None => words.iter().for_each(|w| self.here.say(w, None)),
             }
             return Ok(Came::Library);
         };
         // nothing else: a misspelled field would do nothing, and say nothing of why
         for key in it.pairs::<Value, Value>().filter_map(Result::ok).map(|(k, _)| k) {
             let key = key.to_string().unwrap_or_default();
-            if !["kinds", "listen", "own", "languages"].contains(&key.as_str()) {
+            if !["kinds", "except", "listen", "own", "languages", "names"].contains(&key.as_str()) {
                 return Err(mlua::Error::runtime(format!(
-                    "a resident has no `{key}`: it is `kinds`, `listen`, `own` and `languages`"
+                    "a resident has no `{key}`: it is `kinds`, `except`, `listen`, `own`, \
+                     `languages` and `names`"
                 )));
             }
         }
@@ -412,7 +366,10 @@ impl Me {
         let own: Vec<String> = it.get::<Option<Table>>("own")?.map(strings).unwrap_or_default();
         let listen: Option<Function> = it.get("listen")?;
         let heard: Vec<String> = it.get::<Option<Table>>("kinds")?.map(strings).unwrap_or_default();
-        let heard = if listen.is_some() { heard } else { Vec::new() };
+        let except: Vec<String> =
+            it.get::<Option<Table>>("except")?.map(strings).unwrap_or_default();
+        let (heard, except) =
+            if listen.is_some() { (heard, except) } else { (Vec::new(), Vec::new()) };
         let mut languages = Vec::new();
         if let Some(spoken) = it.get::<Option<Table>>("languages")? {
             for pair in spoken.pairs::<String, Value>() {
@@ -420,13 +377,49 @@ impl Me {
                 languages.push((name, to_parts(grammar)?));
             }
         }
-        // what it is, said whole, so one that cannot be holds nothing, and town hears it
+        // what it is, said whole, so one that cannot be owns nothing, and town hears it
         let mut body = Parts::Map(Vec::new());
-        body.set("kinds", Parts::List(heard.iter().map(|k| k.as_str().into()).collect()));
+        let list = |ks: &[String]| Parts::List(ks.iter().map(|k| k.as_str().into()).collect());
+        body.set("kinds", list(&heard));
+        if !except.is_empty() {
+            body.set("except", list(&except));
+        }
         body.set("own", Parts::List(own.iter().map(|k| k.as_str().into()).collect()));
         let spoken_now = languages.clone();
         if !languages.is_empty() {
             body.set("languages", Parts::Map(languages));
+        }
+        // each name, and the kinds one that comes by it hears, but those it `except`s: lists,
+        // though Lua's `{}` is no more a list than a map
+        if let Some(given) = it.get::<Option<Table>>("names")? {
+            let mut names = Vec::new();
+            for pair in given.pairs::<Value, Value>() {
+                let (name, it) = pair?;
+                let Value::String(name) = name else {
+                    return Err(mlua::Error::runtime(
+                        "names are each a name and its { kinds, except }",
+                    ));
+                };
+                let name = name.to_str()?.to_string();
+                let no =
+                    || mlua::Error::runtime(format!("`{name}`: a name is {{ kinds, except }}"));
+                let Value::Table(it) = it else { return Err(no()) };
+                for key in it.pairs::<Value, Value>().filter_map(Result::ok).map(|(k, _)| k) {
+                    if !matches!(key.to_string().ok().as_deref(), Some("kinds" | "except")) {
+                        return Err(no());
+                    }
+                }
+                let of = |field: &str| -> mlua::Result<Vec<String>> {
+                    Ok(it.get::<Option<Table>>(field)?.map(strings).unwrap_or_default())
+                };
+                let mut given = Parts::map([("kinds", list(&of("kinds")?))]);
+                let except = of("except")?;
+                if !except.is_empty() {
+                    given.set("except", list(&except));
+                }
+                names.push((name, given));
+            }
+            body.set("names", Parts::Map(names));
         }
         let kind = format!("{RESIDENTS}/{name}");
         self.here.say(&Word::new(kind, Tense::Present, Body::of(body)), None);
@@ -434,46 +427,20 @@ impl Me {
         // but not one another is: town refuses it, and that one's stays
         let free = |(n, _): &(String, Parts)| self.here.languages.get(n).is_err();
         let spoken_now: Vec<(String, Parts)> = spoken_now.into_iter().filter(free).collect();
-        self.here.languages.are(&mine(&name), &spoken_now);
+        self.here.languages.are(&languages_of(&name), &spoken_now);
         for w in held.take().unwrap_or_default() {
             self.here.say(&w, Some(&name));
         }
-        self.came.set(self.came.get() + 1);
-        let came = self.came.get();
-        let file =
-            File { path: path.to_path_buf(), name: name.clone(), came, kinds: heard, listen };
-        // its present, before any word, in town's order: read from town, of the kinds lua heard
-        // before it came; of those lua hears now it did not, town tells lua as it said the fact
-        if let Some(listen) = &file.listen {
-            let mut present = BTreeMap::new();
-            self.here.reading.set(Some(came));
-            for k in &file.kinds {
-                // a read town does not answer: it has come, so it goes, holding nothing
-                let read = self.here.read(k, "present").inspect_err(|_| {
-                    self.here.reading.set(None);
-                    self.leaves(&file)
-                })?;
-                match (is_kind(k), read) {
-                    (_, Parts::None) => {}
-                    (true, body) => drop(present.insert(k.clone(), body)),
-                    (false, Parts::Map(all)) => present.extend(all),
-                    (false, _) => {}
-                }
-            }
-            self.here.reading.set(None);
-            for (kind, body) in present.into_iter().filter(|(kind, _)| self.heard_before(kind)) {
-                let fact = Word::new(kind, Tense::Present, Body::of(body));
-                self.listen(lua, &name, listen, &fact);
-            }
-        }
-        self.files.borrow_mut().push(file);
+        // its present, then `now`, town tells it as it takes its fact
+        self.files.borrow_mut().push(File { path: path.to_path_buf(), name, listen });
         Ok(Came::Resident)
     }
 
     /// Where a file runs, `_ENV`, all its own: its `talk`, which speaks as it, however late; its
     /// `present` and `past`, read from town; how a resident is written; and each library read
-    /// before it the first time it came, so one that comes again alone has those it had. Nothing is
-    /// shared through Lua: one that comes again begins again.
+    /// before it the first time it came, so one that comes again alone has those it had. What is
+    /// its own begins again as it comes again; what is Lua's, `_G` and `package.loaded`, is shared
+    /// by every file, and outlives a save.
     fn place(&self, lua: &Lua, path: &Path, name: &str, held: &Held) -> mlua::Result<Table> {
         let (here, by, still) = (self.here.clone(), name.to_string(), held.clone());
         // a library read into it says nothing as it is read: it said its words once, read alone
@@ -538,7 +505,7 @@ fn named(name: &str) -> &str {
 
 /// Where the languages a file is are kept in lua's own, by its name: spoken as it comes, before
 /// town says its fact back.
-fn mine(name: &str) -> String {
+fn languages_of(name: &str) -> String {
     format!("lua/{name}")
 }
 
@@ -577,10 +544,6 @@ fn install(lua: &Lua, here: &Rc<Here>) -> mlua::Result<()> {
             Ok(t)
         })?,
     )?;
-    // town itself, to name in a join: `join(kind, { TOWN, … })`
-    lua.globals().set("TOWN", std::env::var("TOWN").ok())?;
-    // town's watch, to join by its path: `join(kind, { WATCH, path })`
-    lua.globals().set("WATCH", std::env::var("WATCH").ok())?;
     let reads = here.clone();
     lua.globals().set(
         "parts",
@@ -626,8 +589,12 @@ fn before(lua: &Lua, path: &Path) -> mlua::Result<usize> {
     Ok(n)
 }
 
-/// parts, as Lua holds them
+/// parts, as Lua keeps them, however deep: each step grows the stack as it needs
 fn to_lua(lua: &Lua, p: &Parts) -> mlua::Result<Value> {
+    town::parts::deep(|| to_lua_step(lua, p))
+}
+
+fn to_lua_step(lua: &Lua, p: &Parts) -> mlua::Result<Value> {
     Ok(match p {
         Parts::None => Value::Nil,
         Parts::Text(t) => Value::String(lua.create_string(t)?),
@@ -638,8 +605,8 @@ fn to_lua(lua: &Lua, p: &Parts) -> mlua::Result<Value> {
             _ => Value::String(lua.create_string(n)?),
         },
         Parts::Bool(b) => Value::Boolean(*b),
-        // a Lua list holds no nil, so a nothing in it is `null`; and it is marked, so even an empty
-        // one is a list again
+        // a Lua list contains no nil, so a nothing in it is `null`; and it is marked, so even an
+        // empty one is a list again
         Parts::List(l) => {
             let t = lua.create_table_with_capacity(l.len(), 0)?;
             if let Ok(mark) = lua.named_registry_value::<Table>(LIST) {
@@ -663,16 +630,18 @@ fn to_lua(lua: &Lua, p: &Parts) -> mlua::Result<Value> {
     })
 }
 
-/// what Lua holds, as parts
+/// what Lua keeps, as parts
 fn to_parts(v: Value) -> mlua::Result<Parts> {
-    read(v, 0)
+    read(v, &mut HashSet::new())
 }
 
-fn read(v: Value, deep: usize) -> mlua::Result<Parts> {
-    // a table that holds itself goes on without end
-    if deep > DEEP {
-        return Err(mlua::Error::runtime("parts too deep: a table that holds itself?"));
-    }
+/// `v` as parts, `within` the tables it is read inside: one that contains itself goes on without
+/// end. However deep: each step grows the stack as it needs
+fn read(v: Value, within: &mut HashSet<*const std::ffi::c_void>) -> mlua::Result<Parts> {
+    town::parts::deep(|| read_step(v, within))
+}
+
+fn read_step(v: Value, within: &mut HashSet<*const std::ffi::c_void>) -> mlua::Result<Parts> {
     Ok(match v {
         Value::Nil => Parts::None,
         Value::LightUserData(u) if u.0.is_null() => Parts::None,
@@ -685,14 +654,19 @@ fn read(v: Value, deep: usize) -> mlua::Result<Parts> {
             Err(_) => Parts::Bytes(s.as_bytes().to_vec()),
         },
         Value::Table(t) => {
+            if !within.insert(t.to_pointer()) {
+                return Err(mlua::Error::runtime("a table that contains itself is no parts"));
+            }
             let pairs: Vec<(Value, Value)> = t.pairs().collect::<mlua::Result<_>>()?;
             let n = t.raw_len();
             let marked = t.metatable().is_some_and(|m| {
                 m.raw_get::<Option<String>>("__name").ok().flatten().as_deref() == Some(LIST)
             });
             if marked || (n > 0 && pairs.len() == n) {
-                let l = t.sequence_values().map(|v| read(v?, deep + 1));
-                Parts::List(l.collect::<mlua::Result<_>>()?)
+                let l = t.sequence_values().map(|v| read(v?, within));
+                let l = Parts::List(l.collect::<mlua::Result<_>>()?);
+                within.remove(&t.to_pointer());
+                l
             } else {
                 let mut m = Parts::Map(Vec::new());
                 for (k, v) in pairs {
@@ -702,8 +676,9 @@ fn read(v: Value, deep: usize) -> mlua::Result<Parts> {
                         Value::Number(n) => n.to_string(),
                         k => return Err(not_a_part(&k, "name")),
                     };
-                    m.set(name, read(v, deep + 1)?);
+                    m.set(name, read(v, within)?);
                 }
+                within.remove(&t.to_pointer());
                 m
             }
         }
@@ -759,6 +734,29 @@ mod tests {
         }
     }
 
+    // a table that contains itself is no parts, however deep; one held twice side by side is
+    #[test]
+    fn a_table_that_holds_itself_is_no_parts() {
+        let (_me, lua, env) = placed();
+        let said = |code: &str| to_parts(read(&lua, &env, code));
+        let err = said("local t = {}; t.me = t; return t").unwrap_err().to_string();
+        assert!(err.contains("contains itself"), "{err}");
+        let twice = said("local a = { 1 }; return { x = a, y = a }").unwrap();
+        assert_eq!(twice.get("x"), twice.get("y"));
+    }
+
+    // a table however deep is parts, and back: neither way runs out of stack
+    #[test]
+    fn a_deep_table_is_parts() {
+        let (_me, lua, env) = placed();
+        let code = "local t = {}; local at = t
+            for _ = 1, 100000 do at.x = {}; at = at.x end
+            return t";
+        let deep = to_parts(read(&lua, &env, code)).unwrap();
+        let back = to_parts(to_lua(&lua, &deep).unwrap()).unwrap();
+        assert!(back == deep, "the same, back");
+    }
+
     // a resident of clauses hears the kinds they name, those it names, and every kind if a clause
     // names none; errors only if a clause names them. A word wakes the first clause that hears its
     // kind, or none.
@@ -772,6 +770,12 @@ mod tests {
         assert_eq!(kinds(r#"kinds = { "theme" }, on("note", print)"#), ["note", "theme"]);
         assert_eq!(kinds(r#"on("a", print), on({ tense = "past" }, print)"#), ["/"], "but errors");
         assert_eq!(kinds(r#"on("town/error", print), on({}, print)"#), ["/", "town/error"]);
+        let except: Vec<String> = read(
+            &lua,
+            &env,
+            r#"return react{ except = { "x/" }, on({ tense = "past" }, print) }.except"#,
+        );
+        assert_eq!(except, ["x/"], "every kind, but those it excepts");
         let code =
             r#"return react{ on("/peer", function(w) return w.kind end), on("note", print) }"#;
         let listen: Function = read::<Table>(&lua, &env, code).get("listen").unwrap();

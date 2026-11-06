@@ -19,6 +19,44 @@ pub fn alive(pid: Pid) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Wait until a process has ended, as the kernel says it: not by asking again and again. One
+/// already gone has ended. It waits as a thread does, so a test waits for it aside.
+#[cfg(all(test, target_os = "macos"))]
+pub fn exited(pid: Pid) {
+    // SAFETY: a kqueue of our own, one event of ours for C to fill, and the queue closed after
+    unsafe {
+        let queue = libc::kqueue();
+        assert!(queue >= 0, "a kqueue");
+        let mut ask: libc::kevent = std::mem::zeroed();
+        ask.ident = pid as usize;
+        ask.filter = libc::EVFILT_PROC;
+        ask.flags = libc::EV_ADD | libc::EV_ONESHOT;
+        ask.fflags = libc::NOTE_EXIT;
+        let mut told: libc::kevent = std::mem::zeroed();
+        // none to watch is gone already; else it waits for the one word
+        let null = std::ptr::null();
+        let n = libc::kevent(queue, &ask, 1, &mut told, 1, null);
+        let gone = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        libc::close(queue);
+        assert!(n == 1 || gone, "the kernel would not say when {pid} ends");
+    }
+}
+
+/// As on macOS, by a descriptor for the process, readable once it has ended.
+#[cfg(all(test, target_os = "linux"))]
+pub fn exited(pid: Pid) {
+    // SAFETY: a descriptor of our own, polled, then closed
+    unsafe {
+        let fd = libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int;
+        if fd < 0 {
+            return; // gone already
+        }
+        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        libc::poll(&mut poll, 1, -1);
+        libc::close(fd);
+    }
+}
+
 /// Whether this process was started to ignore a signal: under `nohup`, or as a job in the
 /// background.
 pub fn ignored(signal: i32) -> bool {
@@ -28,4 +66,12 @@ pub fn ignored(signal: i32) -> bool {
         libc::sigaction(signal, std::ptr::null(), &mut was);
         was.sa_sigaction == libc::SIG_IGN
     }
+}
+
+/// Hold a file's lock, alone, while the file is open; whether it could be had now. It lets go as
+/// the process ends, however it ends.
+pub fn lock(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a lock on a file we keep open; it touches no memory of ours
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }

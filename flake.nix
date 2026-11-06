@@ -16,14 +16,12 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           # town's own residents, for a town to name first: its languages and `reload`, and `lua`,
-          # built, which speaks for every Lua file; and its watch, which town gives as `WATCH`.
-          # Neither on PATH, where each would hide one of its name; their sources left behind
+          # built, which speaks for every Lua file, its source left behind. `mirror` is a program
+          # like any, on PATH beside town
           postInstall = ''
             mkdir -p $out/share/town/residents
             cp -r residents/languages residents/reload.lua $out/share/town/residents/
             mv $out/bin/lua $out/share/town/residents/lua
-            mkdir -p $out/libexec/town
-            mv $out/bin/watch $out/libexec/town/watch
           '';
         };
       });

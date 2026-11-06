@@ -1,4 +1,4 @@
-//! A word: a kind, a tense, a body, and when it was said. The README's *words*.
+//! A word: a kind, a tense, a body, and when it was said. PROTOCOL.md's *Words*.
 //!
 //! - **present**: folds into the present.
 //! - **past**, **future**: pass through.
@@ -46,7 +46,8 @@ impl Word {
     }
 
     /// That the present is told, and what follows is now: a bodiless past word at `""`, where the
-    /// listener stands. It is written to a listener, never said in town, and `""` is no kind.
+    /// listener stands. Told to a resident; said by one, that it has said again each fact it has
+    /// (`Town::said`). Never talked, and `""` is no kind.
     pub fn now() -> Word {
         Word::new("", Tense::Past, Body::none())
     }
@@ -93,9 +94,48 @@ pub fn hears(kind: &str, said: &str) -> bool {
     (said == kind && !under) || ((down || under) && below)
 }
 
+/// Whether the path `kind` passes through `p`: `p`'s parts are in it whole, in order, anywhere, as
+/// a Usenet site is in an article's `Path:`. `a/b/c` passes through `b` and `a/b`, not `a/c`.
+pub fn through(p: &str, kind: &str) -> bool {
+    let p: Vec<&str> = p.split('/').collect();
+    let kind: Vec<&str> = kind.split('/').collect();
+    kind.windows(p.len()).any(|parts| parts == p.as_slice())
+}
+
+/// Whether one that hears `kinds`, but `except`, hears a word of kind `said`: one of its kinds
+/// names it (`hears`), and none of what it takes out does.
+pub fn heard(kinds: &[String], except: &[String], said: &str) -> bool {
+    kinds.iter().any(|k| hears(k, said)) && !except.iter().any(|k| hears(k, said))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hears, is_kind};
+    use super::{heard, hears, is_kind, through};
+
+    // a path passes through another where the other's parts are in it whole and in order, at any
+    // place: so a domain is found wherever it is, but never in part
+    #[test]
+    fn a_path_passes_through_what_is_in_it_whole() {
+        assert!(through("b", "a/b/c") && through("a/b", "a/b/c") && through("a/b/c", "a/b/c"));
+        assert!(!through("a/c", "a/b/c") && !through("b", "a/bb/c") && !through("a/b/c/d", "a/b"));
+        assert!(!through("", "a"), "no kind has an empty part");
+    }
+
+    // what one takes out, `except`, it does not hear, of what its kinds name; and a kind is any
+    // text
+    #[test]
+    fn an_exclusion_takes_out_what_it_names() {
+        let kinds = |k: &[&str]| k.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let (all, other) = (kinds(&["/"]), kinds(&["other/"]));
+        assert!(
+            heard(&all, &other, "theme") && heard(&all, &other, "other"),
+            "all but under other"
+        );
+        assert!(!heard(&all, &other, "other/theme") && !heard(&all, &other, "other/a/b"));
+        let theme = kinds(&["theme"]);
+        assert!(!heard(&theme, &kinds(&["/theme"]), "theme"), "taken out, however named");
+        assert!(hears("!theme", "!theme"), "a kind is any text, `!` too");
+    }
 
     // a kind is itself; with `/` after, what is under it; with `/` before, both; `/`, every kind
     #[test]

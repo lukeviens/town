@@ -24,6 +24,11 @@ fn town_home() -> PathBuf {
     d
 }
 
+/// What one town keeps while it runs, so no other opens on its log.
+pub fn lock() -> PathBuf {
+    town_home().join("town.lock")
+}
+
 pub fn square() -> PathBuf {
     town_home().join("square.sock")
 }

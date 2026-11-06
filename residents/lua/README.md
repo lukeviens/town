@@ -27,7 +27,7 @@ return react{
 ```
 
 ```
-town talk past hello from=me   # town listen hears a hi
+echo '{"kind":"hello","tense":"past","body":{"from":"me"}}' | town '{}'   # a listener hears a hi
 ```
 
 What a file talks as it is read is said once it has opened, in order: one that fails to open has
@@ -35,11 +35,10 @@ done nothing.
 
 On a save, the resident saved goes and comes again, alone:
 
-- **across a save**: it keeps nothing but what the present holds.
+- **across a save**: it keeps nothing but what is in the present.
 - **the others**: they stay as they are.
 - **what it joined**: goes with it, as all it speaks for does, and is joined again as it comes.
-- **what it asked**: a `town/work` or `town/after` is still answered, though not once town itself
-  starts again.
+- **what it asked**: a `town/work` is still answered, though not once town itself starts again.
 - **a library**: a save of one opens every Lua file again, in a new Lua, since the files after it
   are written with it; as does a save of a Lua file `lua` has not opened: one new, or one that
   failed.
@@ -50,19 +49,17 @@ A resident is written with these, the same in every town, from [`resident`](resi
 fact(kind, body)  event(kind, body)  intent(kind, body)    a word in each tense
 on(what, act)                 a clause: a kind, or { kind, tense, by }; act(w) answers
 react{ on…, on… }             a resident from clauses: the first that matches answers; beside
-                              them, by name, `own` and `languages`
+                              them, by name, `kinds` it hears besides, those it `except`s,
+                              `own`, `languages` and `names`
 present(kind)  past(kind)     a kind's fact now; its facts before, oldest first; for `kind/`,
                               `/kind` or `/`, those of each kind it names
 talk(word)                    say a word, besides answering
-work(cmd, body)               run a command without blocking: a future `town/work`, answered past
-after(ms, body)               wait without blocking: a future `town/after`, answered past
+work(argv, body)              run a program without blocking, argv as given: a future `town/work`,
+                              answered past as it ends. A shell is `{ "sh", "-c", cmd }`; a wait,
+                              `{ "sleep", "2" }`
 join(kind, argv, body)        talk with a program, as kind: it says words there, and is told them,
                               in the language `speaks` names: a future `town/join`, answered past
                               as it ends
-connect(kind, to, body)       talk with a socket, a path or a host:port, as join does a program:
-                              a future `town/connect`, answered past as it ends
-TOWN                          town itself, for a program to call: `$TOWN talk …`
-WATCH                         town's watch, to join by its path: `join(kind, { WATCH, path })`
 read(path, as)                a file, read whole: text, or with `as`, the parts of that language
 post(path, body, as)          a file written whole, so a reader sees the old or the new
 mend(path, make, as)          a missing file, made from what make() returns

@@ -1,14 +1,6 @@
-//! A voice: how a resident speaks, a program, one at the square, a join, a socket. The README's
-//! *residents*.
-//!
-//! - **first**: it says what it is, a `Resident`, and town says that as its fact.
-//! - **where it stands**: the root, or, joined, at a kind. What it says is read here as words, each
-//!   by its kind's path from there.
-//! - **saying**: in by the one door, `Town::said`.
-//! - **told**: by `tell`.
-//! - **its language**: JSON, a line each, unless it speaks another; a grammar, as far as it reads.
-//!
-//! Here alone bytes become words, and words bytes.
+//! A voice: how a resident speaks. Here alone bytes become words, and words bytes: what it says is
+//! read in its language, each kind a path from where it stands, and goes in by the one door,
+//! `Town::said`; it is told by `tell`.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -20,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::body::Body;
 use crate::language::{Language, Languages, Read};
 use crate::parts::Parts;
-use crate::town::{Here, Listening, Resident, Town};
+use crate::town::{Here, Listening, Resident, To, Town};
 use crate::word::{hears, is_kind, Tense, Word, KIND};
 
 /// The language a resident speaks: one, both ways, or the one it says and the one it hears.
@@ -48,44 +40,53 @@ impl Speaks {
 }
 
 impl Resident {
-    /// the language it says, and the one it hears, by name: JSON if it names none
-    pub fn languages(&self) -> (&str, &str) {
-        self.speaks.as_ref().map_or(("json", "json"), Speaks::names)
-    }
-
-    /// Whether it is told this word: of its kinds, its own among them, so each hears in town's one
-    /// order; of the kinds of those it speaks for, however deep (`Town::hears_for`); and, joined,
-    /// each future word at its kind or under it, unless a nearer join stands there. Never its own
-    /// errors, each of which could make another, but those of the ones it speaks for, as any
-    /// error, each with the `place` of the one it is of; but one at the square hears its own, and
-    /// theirs, always, whatever it names: it has no other way to be told.
+    /// Whether it is told this word, for itself: of its kinds, its own among them, so each hears in
+    /// town's one order; and, joined, each future word at its kind or under it, unless a nearer
+    /// join stands there. Never its own errors, each of which could make another, but one at the
+    /// square, whatever it names: it has no other way to be told. Never one said in answer to an
+    /// error. What those it speaks for hear, it is told `by` them (`tells`).
     pub fn hears(&self, town: &Town, w: &Word) -> bool {
-        // its own error, by who it is, not by name, which many may go by
-        if w.kind == crate::word::ERROR && w.by != 0 {
-            if self.square && town.is_its(self.id, w.by) {
-                return true;
+        if w.kind == crate::word::ERROR {
+            // its own error, by who it is, not by name, which many may go by
+            if w.by != 0 && w.by == self.id {
+                return self.square;
             }
-            if w.by == self.id {
+            // one said in answer to an error, none that hears errors is told: so none answers it
+            if w.body.part("answering") == Some(&Parts::Bool(true)) {
                 return false;
             }
         }
-        self.wanted(town, w)
-            || self.kinds.iter().any(|k| hears(k, &w.kind))
-            || town.hears_for(self.id, &w.kind)
+        self.wanted(town, w) || self.names(&w.kind)
     }
 
-    /// what it hears, as `hears` says, to listen by: keeping only what `hears` reads
-    pub fn hearing(&self) -> impl Fn(&Town, &Word) -> bool + 'static {
-        let (kinds, at) = (self.kinds.clone(), self.at.clone());
-        let me = Resident { id: self.id, square: self.square, kinds, at, ..Resident::default() };
-        move |town, w| me.hears(town, w)
+    /// Whether its kinds name `kind`, as any list of patterns does (`heard`): but not, come by a
+    /// name, what passes through the name, which came by it, or by it from one it reaches.
+    fn names(&self, kind: &str) -> bool {
+        let passes = self.visitor && crate::word::through(&self.name, kind);
+        crate::word::heard(&self.kinds, &self.except, kind) && !passes
     }
 
-    /// What it hears, from now, as one coming (`Words::coming`): until it is told, only `WAITING`
-    /// words wait.
+    /// Whom a word is for, of it and those it speaks for, as each `hears`, to listen by: itself,
+    /// and each it speaks for, by name, as it is when the word is said. Keeping only what `hears`
+    /// reads.
+    pub fn tells(&self) -> impl Fn(&Town, &Word) -> Vec<To> + 'static {
+        let (kinds, except, at) = (self.kinds.clone(), self.except.clone(), self.at.clone());
+        let (id, square, visitor, name) = (self.id, self.square, self.visitor, self.name.clone());
+        let me = Resident { id, square, visitor, name, kinds, except, at, ..Resident::default() };
+        move |town, w| {
+            let spoken = town.spoken_by(id);
+            let spoken = spoken.iter().filter(|(_, r)| r.hears(town, w));
+            let it = me.hears(town, w).then_some(To::It);
+            it.into_iter().chain(spoken.map(|(name, _)| To::One(name.clone()))).collect()
+        }
+    }
+
+    /// What it hears, from now, as one coming (`Words::coming`): until it is told, only as many
+    /// words wait as it says (`waits`).
     pub fn listening(&self, town: &Town) -> Listening {
-        let mut words = town.words.coming(WAITING, self);
-        words.hear(town, self.hearing());
+        let mut words = town.words.coming(self);
+        words.waits(self.waits);
+        words.tell(town, self.tells());
         words
     }
 
@@ -97,13 +98,14 @@ impl Resident {
     }
 
     /// the facts now it is told as it starts, as words, by kind, each by its path from where it
-    /// stands: of its kinds, and those it speaks for, and, standing at a kind, at it and under it
-    fn present(&self, town: &Town) -> Vec<Word> {
-        let here = self.at.iter().map(|at| format!("/{at}"));
+    /// stands: of its kinds. Not, standing at a kind, what is there: it says that itself.
+    pub(crate) fn present(&self, town: &Town) -> Vec<Word> {
         let mut present = std::collections::BTreeMap::new();
-        for kind in self.kinds.iter().cloned().chain(town.kinds_for(self.id)).chain(here) {
-            present.extend(town.facts(&kind));
+        for kind in &self.kinds {
+            present.extend(town.facts(kind));
         }
+        // what its kinds hear, but what it excepts
+        present.retain(|kind, _| self.names(kind));
         let word = |(kind, body)| self.placed(Word::new(kind, Tense::Present, body));
         present.into_iter().map(word).collect()
     }
@@ -121,8 +123,8 @@ impl Resident {
 }
 
 /// Why a resident does not come to live: it stops speaking before it says what it is; what it
-/// says it is cannot be, and why; or it stops speaking, or the town stops, as it waits for its
-/// languages.
+/// says it is cannot be, and why; or it stops speaking, ends, or the town stops, as it waits for
+/// its name or its languages.
 pub enum Unsaid {
     Mute,
     Refused(String),
@@ -141,29 +143,71 @@ pub struct Life<R> {
 }
 
 /// A resident, from its first line, what it is, to its languages said. It is heard from the moment
-/// it comes, so a fact is heard once; until it is told, only so many words wait, since it may never
-/// be. `waits` is told of each language not said yet.
+/// it comes, so a fact is heard once, and all it hears waits for it until it is told, as many as it
+/// `waits` for once it says what it is. `waits` is told of each language not said yet.
 pub async fn comes<R: AsyncRead + Unpin>(
     town: &Rc<Town>,
     who: &Resident,
     mut voice: Voice<R>,
-    waits: impl AsyncFnMut(&str),
+    mut waits: impl AsyncFnMut(&str),
 ) -> Result<Life<R>, Unsaid> {
-    let mut words = town.words.coming(WAITING, who);
+    let mut words = town.words.coming(who);
     let first = voice.next().await.ok_or(Unsaid::Mute)?;
-    let said: Resident = serde_json::from_str(&first)
-        .map_err(|e| Unsaid::Refused(format!("its first line must say what it is: {e}")))?;
-    let resident = Resident {
-        kinds: said.kinds,
-        own: said.own,
-        speaks: said.speaks,
-        languages: said.languages,
-        ..who.clone()
+    let resident = match named(who, &first) {
+        Some(name) => {
+            // while it waits for its name it is read too, so one that hangs up goes, and waits no
+            // more; what it says meanwhile is held for when it lives
+            let it = {
+                let given = town.named(&name, &mut waits);
+                tokio::pin!(given);
+                loop {
+                    tokio::select! {
+                        it = &mut given => break it.ok_or(Unsaid::Gone)?,
+                        _ = voice.more() => {}
+                    }
+                    if voice.ended {
+                        return Err(Unsaid::Gone);
+                    }
+                }
+            };
+            // heard from now, as it comes: what was said while it waited was not to it
+            words = town.words.coming(who);
+            Resident { kinds: it.kinds, except: it.except, name, visitor: true, ..who.clone() }
+        }
+        None => {
+            let said: Resident = crate::parts::json(first.as_bytes())
+                .map_err(|e| Unsaid::Refused(format!("its first line must say what it is: {e}")))?;
+            Resident {
+                kinds: said.kinds,
+                except: said.except,
+                own: said.own,
+                speaks: said.speaks,
+                languages: said.languages,
+                names: said.names,
+                waits: said.waits,
+                most: said.most,
+                keep: said.keep,
+                ..who.clone()
+            }
+        }
     };
-    words.hear(town, resident.hearing());
+    words.waits(resident.waits);
+    words.tell(town, resident.tells());
     let here = town.come(&resident).map_err(Unsaid::Refused)?;
     let resident = Life::speaking(town, resident, words, voice, waits).await;
     Ok(Life { _here: Some(here), ..resident.ok_or(Unsaid::Gone)? })
+}
+
+/// The name one at the square comes by, if it comes by one, `{"name": "luke"}`, as another town
+/// does: it is then what the resident that names it says, and nothing else.
+fn named(who: &Resident, first: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Named {
+        name: String,
+    }
+    let named: Named = crate::parts::json(first.as_bytes()).ok().filter(|_| who.square)?;
+    Some(named.name)
 }
 
 impl<R: AsyncRead + Unpin> Life<R> {
@@ -179,7 +223,8 @@ impl<R: AsyncRead + Unpin> Life<R> {
         mut waits: impl AsyncFnMut(&str),
     ) -> Option<Life<R>> {
         let who = &resident.clone();
-        let (says, hears) = who.languages();
+        // by name: JSON if it names none
+        let (says, hears) = who.speaks.as_ref().map_or(("json", "json"), Speaks::names);
         let waiting = async {
             town.language(says, &mut waits).await?;
             town.language(hears, &mut waits).await
@@ -219,8 +264,8 @@ impl<R: AsyncRead + Unpin> Life<R> {
 
     /// It lives, both ways at once: what it says comes in by `Town::said`, and what it hears is
     /// told `to` by `tell`. One that stops reading is still heard. A program lives until `end`: one
-    /// that stops saying is still told, and what it said is heard to the end of its output, but
-    /// `LAST` after its end at most. A socket, with no `end`, lives until it stops saying.
+    /// that stops saying is still told, and what it said is heard to the end of its output. A
+    /// socket, with no `end`, lives until it stops saying.
     pub async fn live(
         self,
         town: &Town,
@@ -236,74 +281,78 @@ impl<R: AsyncRead + Unpin> Life<R> {
         let telling = async {
             // in its language as it is now: none, while none speaks it, and what it is told cannot
             // be said in it
-            let to = async |w: &Word| match town.languages.get(&hears) {
-                Ok(hears) => say(to, w, &hears, &town.languages).await,
+            let to = async |w: &Word, by: Option<&str>| match town.languages.get(&hears) {
+                Ok(hears) => say(to, w, by, &hears, &town.languages, resident.most).await,
                 Err(_) => Ok(false),
             };
             tell(town, &resident, words, to).await;
             std::future::pending::<()>().await
         };
         // told until it ends, though it stops saying; and what it said before its end is heard
-        // to the end of its output, but `LAST` at most: what it started may hold that open
+        // to the end of its output
         let living = async {
             let Some(end) = end else { return saying.await };
-            tokio::pin!(saying, end);
-            tokio::select! {
-                biased;
-                _ = &mut saying => { end.await; }
-                _ = &mut end => {
-                    let _ = tokio::time::timeout(crate::program::LAST, saying).await;
+            tokio::join!(saying, end);
+        };
+        // one that came by a name lives as long as the name is what it came by
+        let named = async {
+            match resident.visitor {
+                true => {
+                    let is = crate::town::Name {
+                        kinds: resident.kinds.clone(),
+                        except: resident.except.clone(),
+                    };
+                    town.renamed(&resident.name, &is).await
                 }
+                false => std::future::pending().await,
             }
         };
         tokio::select! {
             _ = living => {}
             _ = telling => {}
+            _ = named => {}
         }
     }
 }
 
-/// How many words may wait for a resident that stops reading: all one may cost town. Those after
-/// are dropped, and that is said, once each time it falls behind.
-pub(crate) const WAITING: usize = 1024;
-
-/// Tell a resident what it hears, by `to`, until `to` fails or the town ends.
-///
-/// 1. the present of its kinds, as it is now, whole;
-/// 2. `now`;
-/// 3. each word it hears since it came, but a fact that came before, as the present holds it.
-///
-/// - **more than may wait**: what waited is told still, and that it may have missed what came
-///   after is said.
-/// - **what `to` cannot hold**: `false`, passed over, unless it is wanted of it: then a
-///   `town/error` from it.
-/// - **another's error**: told last, what it says now may answer it (`Town::telling`).
+/// Tell a resident what it hears, by `to`, until `to` fails or the town ends: the present of its
+/// kinds, `now`, then each word since it came. What `to` cannot say is passed over, or, wanted of
+/// it, its error; another's error told last marks what it says now as answering
+/// (`Town::telling`).
 pub async fn tell(
     town: &Town,
     resident: &Resident,
     mut words: Listening,
-    mut to: impl AsyncFnMut(&Word) -> std::io::Result<bool>,
+    mut to: impl AsyncFnMut(&Word, Option<&str>) -> std::io::Result<bool>,
 ) {
     // however it ends, it is told no more
     struct Telling<'a>(&'a Town, &'a Resident);
     impl Drop for Telling<'_> {
         fn drop(&mut self) {
-            self.0.telling(self.1, None);
+            self.0.telling(self.1.id, None);
         }
     }
     let _telling = Telling(town, resident);
     if words.told() {
-        town.error(resident, None, "may have missed words before it was told".into());
+        town.befell(resident, "may have missed words before it was told".into(), false);
     }
     for w in resident.present(town).into_iter().chain([Word::now()]) {
-        if to(&w).await.is_err() {
+        if to(&w, None).await.is_err() {
             return;
         }
     }
-    while let Some(w) = words.recv().await {
-        town.telling(resident, Some(&w));
-        let (wanted, kind) = (resident.wanted(town, &w), w.kind.clone());
-        match to(&resident.placed(w)).await {
+    while let Some((w, is_for)) = words.next().await {
+        let by = match is_for {
+            To::It => None,
+            To::One(name) => Some(name),
+        };
+        // who is told it: itself, or the one it speaks for that the name is
+        let spoken = by.as_ref().and_then(|name| {
+            town.spoken_by(resident.id).iter().find(|(n, _)| n == name).map(|(_, r)| r.id)
+        });
+        town.telling(spoken.unwrap_or(resident.id), Some(&w));
+        let (wanted, kind) = (by.is_none() && resident.wanted(town, &w), w.kind.clone());
+        match to(&resident.placed(w), by.as_deref()).await {
             Ok(true) => {}
             Ok(false) if wanted => {
                 town.error(resident, Some(&kind), "cannot be said in its language".into())
@@ -314,38 +363,30 @@ pub async fn tell(
     }
 }
 
-/// The most a line or a unit may take, or what is held for a language not said yet: what is past
-/// it is let go, and a header that says more is not of its language, so none can make town hold
-/// without end.
-#[cfg(not(test))]
-const MOST: usize = 16 * 1024 * 1024;
-/// less in a test, so it is quickly reached: still more than a read holds at once
-#[cfg(test)]
-const MOST: usize = 64 * 1024;
-
 /// A resident's voice: what it says, as it comes, a line at a time, or a unit of a language at a
-/// time, before it is words (`Speech`). A line is text whatever bytes it holds: what is not UTF-8
-/// reads as �, so one bad line is a line like any other, and what comes after it is heard. Safe to
-/// wait on in a `select!`: what is half read is kept for the next wait.
+/// time, before it is words (`Speech`). A line is text whatever bytes it contains: what is not
+/// UTF-8 reads as �, so one bad line is a line like any other, and what comes after it is heard.
+/// Safe to wait on in a `select!`: what is half read is kept for the next wait.
 pub struct Voice<R> {
     from: tokio::io::BufReader<R>,
     held: Vec<u8>,
     ended: bool,
-    /// a line is past `MOST`: what is left of it is let go
-    over: bool,
     /// how many times a unit has been read, for a test to see the work bounded
+    #[cfg(test)]
     tries: usize,
 }
 
 impl<R: AsyncRead + Unpin> Voice<R> {
     pub fn new(r: R) -> Self {
         let from = tokio::io::BufReader::new(r);
-        Voice { from, held: Vec::new(), ended: false, over: false, tries: 0 }
+        #[cfg(test)]
+        return Voice { from, held: Vec::new(), ended: false, tries: 0 };
+        #[cfg(not(test))]
+        Voice { from, held: Vec::new(), ended: false }
     }
 
     /// The next line, without its end; nothing once the stream has ended or failed. A line held
-    /// already, read as a unit was looked for, is the next. A line is at most `MOST`: what is past
-    /// it is let go, to its end.
+    /// already, read as a unit was looked for, is the next.
     pub async fn next(&mut self) -> Option<String> {
         // how far is looked at for a line's end: each byte once, however long the line
         let mut seen = 0;
@@ -353,28 +394,11 @@ impl<R: AsyncRead + Unpin> Voice<R> {
             let end = self.held[seen..].iter().position(|&c| c == b'\n').map(|n| seen + n);
             seen = self.held.len();
             match end {
-                Some(n) if self.over => {
-                    self.held.drain(..=n);
-                    self.over = false;
-                    seen = 0;
-                    continue;
-                }
-                None if self.over => {
-                    self.held.clear();
-                    seen = 0;
-                }
                 Some(n) => return Some(self.line(n + 1)),
-                None if self.held.len() >= MOST => {
-                    self.over = true;
-                    return Some(self.line(MOST));
-                }
                 None if self.ended => {
                     return (!self.held.is_empty()).then(|| self.line(self.held.len()))
                 }
                 None => {}
-            }
-            if self.ended {
-                return None;
             }
             self.more().await;
         }
@@ -388,11 +412,10 @@ impl<R: AsyncRead + Unpin> Voice<R> {
         String::from_utf8_lossy(&line).into_owned()
     }
 
-    /// what comes, held as far as `MOST`, until the end
+    /// what comes, held, until the end
     async fn held(&mut self) {
         while !self.ended {
             self.more().await;
-            self.held.truncate(MOST);
         }
     }
 
@@ -420,8 +443,7 @@ impl<R: AsyncRead + Unpin> Voice<R> {
     /// - **not of it**: those bytes, so what comes after is heard: to their line's end, or, with
     ///   none, to where it is of the language again, as a binary language has no lines.
     /// - **waiting**: a unit is read again only once as many bytes as it needs have come, and what
-    ///   is held has grown by half since it was last read, or the stream is quiet (`wait`); none
-    ///   takes more than `MOST`.
+    ///   is held has grown by half since it was last read, or no more has come (`wait`).
     async fn unit_held(
         &mut self,
         language: &str,
@@ -436,17 +458,20 @@ impl<R: AsyncRead + Unpin> Voice<R> {
             if self.ended && self.held.is_empty() {
                 return None;
             }
-            self.tries += 1;
+            #[cfg(test)]
+            {
+                self.tries += 1;
+            }
             match language.read(&self.held, self.ended, languages) {
                 Read::Got(p, n) if n > 0 => return Some(Ok((p, n))),
-                Read::More(need) if need <= MOST => {
+                Read::More(need) => {
                     let grown = tried + tried / 2;
                     tried = self.held.len();
                     self.wait(need, grown).await
                 }
                 // nothing held is not yet anything: what comes may be of it
                 _ if self.held.is_empty() => self.more().await,
-                // not of it, of it but empty, or more than a unit may take: let go
+                // not of it, or of it but empty: let go
                 read => {
                     let n = match self.held.iter().position(|&c| c == b'\n') {
                         Some(n) => n + 1,
@@ -475,7 +500,7 @@ impl<R: AsyncRead + Unpin> Voice<R> {
             read = language.read(&self.held[at..], self.ended, languages);
             match read {
                 Read::Got(_, n) if n > 0 => return at,
-                Read::More(need) if need <= MOST => return at,
+                Read::More(_) => return at,
                 _ => {}
             }
         }
@@ -493,7 +518,6 @@ impl<R: AsyncRead + Unpin> Voice<R> {
                 Some(n) => n,
                 None if self.ended && self.held.trim_ascii().is_empty() => return None,
                 None if self.ended => self.held.len(),
-                None if self.held.len() >= MOST => return Some(None),
                 None => {
                     self.more().await;
                     continue;
@@ -515,19 +539,24 @@ impl<R: AsyncRead + Unpin> Voice<R> {
     }
 
     /// As many bytes held as a unit needs, or the end: more is more, a byte at least, whatever a
-    /// grammar says it needs. Then on to `grown`, as far as `MOST`, while more comes: a grammar
-    /// that cannot say what it needs says a byte more, and read again for each would read a unit
-    /// again from its start each time a little comes. What comes and stops, `QUIET`, is read at
-    /// once, as one waits for an answer to what it said.
+    /// grammar says it needs. Then on to `grown`, while more has come already: a grammar that
+    /// cannot say what it needs says a byte more, and read again for each piece would read a unit
+    /// again from its start each time a little comes. What has come is read once no more has.
     async fn wait(&mut self, need: usize, grown: usize) {
         let need = need.max(self.held.len() + 1);
         while self.held.len() < need && !self.ended {
             self.more().await;
         }
-        while self.held.len() < grown.min(MOST) && !self.ended {
-            if tokio::time::timeout(QUIET, self.more()).await.is_err() {
-                return;
-            }
+        while self.held.len() < grown && !self.ended && self.come().await {}
+    }
+
+    /// what has come already, held, if any has: all else that waits goes first
+    async fn come(&mut self) -> bool {
+        tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            _ = self.more() => true,
+            _ = std::future::ready(()) => false,
         }
     }
 
@@ -544,10 +573,6 @@ impl<R: AsyncRead + Unpin> Voice<R> {
         }
     }
 }
-
-/// How long a stream is still before what it holds is read again, though less has come than
-/// `Voice::wait` waits for.
-const QUIET: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// What a resident says, as words in its language, in its `Voice`: in JSON, a blank line is
 /// nothing; and what is no word is a `town/error` from whoever said it. Each kind is a path from
@@ -573,7 +598,7 @@ impl<R: AsyncRead + Unpin> Speech<R> {
             let language = match town.languages.get(&self.language) {
                 Ok(language) => language,
                 Err(_) => {
-                    let waits = async |message: &str| town.error(from, None, message.into());
+                    let waits = async |message: &str| _ = town.notice(from, message.into());
                     town.language(&self.language, waits).await?
                 }
             };
@@ -636,8 +661,12 @@ fn spoken(at: &str, p: &Parts) -> Result<(Word, Option<String>), String> {
 }
 
 /// A word said standing `at` a kind, or the root: its kind is a path from there, `at/a/b` for
-/// `a/b`, and `at` itself for none. One that names no kind, `a//b` or `../x`, is no word.
+/// `a/b`, and `at` itself for none; but `now` is `now` wherever it is said, as it is told. One
+/// that names no kind, `a//b` or `../x`, is no word.
 fn placed(at: &str, mut w: Word) -> Result<Word, String> {
+    if w.is_now() {
+        return Ok(w);
+    }
     w.kind = match (at, w.kind.as_str()) {
         (at, "") => at.to_string(),
         ("", path) => path.to_string(),
@@ -650,25 +679,45 @@ fn placed(at: &str, mut w: Word) -> Result<Word, String> {
 }
 
 /// Write a word to whoever hears it in `language`: the one place a word becomes bytes. A word the
-/// language cannot hold is not written, and is `false`.
+/// language cannot say is not written, and is `false`.
 pub async fn say(
     to: &mut (impl AsyncWrite + Unpin),
     word: &Word,
+    by: Option<&str>,
     language: &Language,
     languages: &Languages,
+    most: Option<usize>,
 ) -> std::io::Result<bool> {
-    match bytes(word, language, languages) {
-        Some(b) => to.write_all(&b).await.map(|_| true),
-        None => Ok(false),
+    match bytes(word, by, language, languages) {
+        Some(b) if most.is_none_or(|most| b.len() <= most) => to.write_all(&b).await.map(|_| true),
+        _ => Ok(false),
     }
 }
 
-/// A word in `language`, as bytes: a line of JSON, or a unit of its language; nothing if the
-/// language cannot hold it.
-pub fn bytes(word: &Word, language: &Language, languages: &Languages) -> Option<Vec<u8>> {
-    match language {
-        Language::Json => Some((line(word) + "\n").into_bytes()),
-        _ => language.bytes(&parts(word), languages),
+/// A word in `language`, as bytes, and `by`, the one spoken for it is told for, beside it, as a
+/// word said for one is: a line of JSON, or a unit of its language; nothing if the language cannot
+/// say it.
+pub fn bytes(
+    word: &Word,
+    by: Option<&str>,
+    language: &Language,
+    languages: &Languages,
+) -> Option<Vec<u8>> {
+    match (language, by) {
+        (Language::Json, None) => Some((line(word) + "\n").into_bytes()),
+        (Language::Json, Some(by)) => {
+            let mut line = line(word);
+            line.pop();
+            let by = serde_json::to_string(by).unwrap_or_default();
+            Some(format!("{line},\"by\":{by}}}\n").into_bytes())
+        }
+        (_, by) => {
+            let mut p = parts(word);
+            if let Some(by) = by {
+                p.set("by", by);
+            }
+            language.bytes(&p, languages)
+        }
     }
 }
 
@@ -718,8 +767,8 @@ pub(crate) fn of(p: &Parts) -> Result<Word, String> {
 
 /// A word as a line of JSON, as the log and every resident that speaks no other say it.
 ///
-/// - **what it holds**: `WORD` and nothing else, as `of` reads parts; and, said by a resident, `by`
-///   (`spoken`).
+/// - **what it contains**: `WORD` and nothing else, as `of` reads parts; and, said by a resident,
+///   `by` (`spoken`).
 /// - **its body**: kept as the bytes it came in, read only if a part is asked for.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -744,9 +793,10 @@ pub fn read(line: &str) -> Result<Word, String> {
     }
 }
 
-/// a line a resident says, as a word, and `by`, the one it speaks for that says it, if it names one
-fn said(line: &str) -> Result<(Word, Option<String>), String> {
-    let l: Line = serde_json::from_str(line).map_err(|e| e.to_string())?;
+/// A line a resident says, or is told, as a word, and `by`, the one spoken for that says it or is
+/// told it, if it names one.
+pub fn said(line: &str) -> Result<(Word, Option<String>), String> {
+    let l: Line = crate::parts::json(line.as_bytes()).map_err(|e| e.to_string())?;
     let tense = match l.tense {
         None => Tense::Present,
         Some(t) => Tense::named(&t).ok_or("a tense is past, present or future")?,
@@ -754,6 +804,24 @@ fn said(line: &str) -> Result<(Word, Option<String>), String> {
     let body = l.body.map_or_else(Body::none, |b| Body::said(b.get().as_bytes()));
     let by = l.by.map(Cow::into_owned);
     Ok((Word { kind: l.kind.into_owned(), tense, body, when: l.when, by: 0 }, by))
+}
+
+/// A word in town's own language, whole, as the log keeps it: a line of JSON. The one
+/// place town's own words become bytes; `owns` reads them back.
+pub fn own(w: &Word) -> Vec<u8> {
+    let mut bytes = line(w).into_bytes();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// What bytes in town's own language contain, in order: each unit as it was said, and the word it
+/// is, if it is one. One cut short, or that is no word, is none, and those around it stand.
+pub fn owns(bytes: &[u8]) -> Vec<(&[u8], Option<Word>)> {
+    let unit = |unit: &[u8]| {
+        let text = String::from_utf8_lossy(unit);
+        read(text.trim_end_matches('\n')).ok()
+    };
+    bytes.split_inclusive(|&b| b == b'\n').map(|u| (u, unit(u))).collect()
 }
 
 /// a word, as a line
@@ -778,7 +846,7 @@ mod tests {
     /// said, and hearing it, it hangs up
     async fn told(town: &Town, resident: &Resident, words: Listening) -> Vec<Body> {
         let (mut told, end) = (Vec::new(), Body::of("end"));
-        let to = async |w: &Word| {
+        let to = async |w: &Word, _: Option<&str>| {
             if w.body == end {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
@@ -792,6 +860,28 @@ mod tests {
         told
     }
 
+    // one come by a name is not told what passes through the name, as it comes or after: so what
+    // came from a town, by any way, is not told back to it
+    #[test]
+    fn one_come_by_a_name_is_not_told_what_passes_through_it() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        town.talk(Word::new("theme", Tense::Present, Body::of("dark")));
+        town.talk(Word::new("luke.example/old", Tense::Present, Body::of(1i64)));
+        town.talk(Word::new("york.example/luke.example/x", Tense::Present, Body::of(1i64)));
+        let who = town.who("luke.example", true);
+        let luke = Resident { kinds: vec!["/".into()], visitor: true, ..who };
+        let told: Vec<String> = luke.present(&town).into_iter().map(|w| w.kind).collect();
+        assert_eq!(told, ["theme"], "nothing through luke.example");
+        let said = |kind: &str| Word::new(kind, Tense::Past, Body::none());
+        for part in ["luke.example.old/x", "x/luke", "luke"] {
+            assert!(luke.hears(&town, &said(part)), "through it only in part: {part}");
+        }
+        for whole in ["luke.example", "luke.example/x", "a/luke.example/x", "a/luke.example"] {
+            assert!(!luke.hears(&town, &said(whole)), "through it: {whole}");
+        }
+    }
+
     // one slow to be told, as more is said than may wait, is not said to fall behind; told, it
     // hears the present as it is then, not as it was when it came, then what waited, and is said
     // to have missed what came after
@@ -803,7 +893,8 @@ mod tests {
             let mut errors = town.words.hear(|_, w| w.kind == "town/error", None);
             town.talk(Word::new("theme", Tense::Present, Body::of("dark")));
             let who = town.who("slow", true);
-            let resident = Resident { kinds: vec!["theme".into()], ..who.clone() };
+            let waits = 4;
+            let resident = Resident { kinds: vec!["theme".into()], waits: Some(waits), ..who };
             let coming = || resident.listening(&town);
             // as many as may wait: the present as it is, and what is not a fact since
             let words = coming();
@@ -817,13 +908,13 @@ mod tests {
             // more: the present as it is, then what waited, though more after it may be missed
             let words = coming();
             town.talk(Word::new("theme", Tense::Past, Body::of("first")));
-            for _ in 0..WAITING {
+            for _ in 0..waits {
                 town.talk(Word::new("theme", Tense::Past, Body::none()));
             }
             town.talk(Word::new("theme", Tense::Present, Body::of("light")));
             assert!(errors.try_recv().is_err(), "not said to fall behind before it is told");
             let mut heard = Vec::new();
-            let to = async |w: &Word| {
+            let to = async |w: &Word, _: Option<&str>| {
                 heard.push(w.body.clone());
                 match heard.len() < 3 {
                     true => Ok(true),
@@ -837,49 +928,79 @@ mod tests {
         });
     }
 
-    // one a speaker comes to speak for after it is told: the speaker is told, at once, the present
-    // facts it hears now and did not, once each, then what is said after
+    /// what a speaker is told, as `(kind, body, by)`, until a past `s` of `end`
+    async fn told_for(
+        town: &Town,
+        s: &Resident,
+        words: Listening,
+        mut then: impl FnMut(),
+    ) -> Vec<(String, Body, Option<String>)> {
+        let mut heard = Vec::new();
+        let to = async |w: &Word, by: Option<&str>| {
+            if w.body == Body::of("end") {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            if w.is_now() && by.is_none() {
+                then();
+            }
+            heard.push((w.kind.clone(), w.body.clone(), by.map(String::from)));
+            Ok(true)
+        };
+        tell(town, s, words, to).await;
+        heard
+    }
+
+    // a speaker is told each word once for each that hears it: bare, for itself; `by` each it
+    // speaks for, however deep, by its name from its place. One it comes to speak for is greeted
+    // with its own present, then `now`, `by` it; one gone is told no more
     #[test]
-    fn a_speaker_is_told_what_one_it_comes_to_speak_for_hears() {
+    fn a_speaker_is_told_each_word_for_each_it_speaks_for() {
         run(async {
             let dir = scratch();
             let town = Town::with_log(dir.log());
             let s = Resident { kinds: vec!["s".into()], ..town.who("s", false) };
             let _s = town.come(&s).unwrap();
-            for (kind, body) in [("s", "mine"), ("x/1", "one"), ("x/2", "two"), ("y", "why")] {
-                town.talk(Word::new(kind, Tense::Present, Body::of(body)));
-            }
+            town.talk(Word::new("s", Tense::Present, Body::of("mine")));
+            town.talk(Word::new("x", Tense::Present, Body::of("one")));
             let it = |kinds: serde_json::Value| Body::of(serde_json::json!({ "kinds": kinds }));
-            let say = |name: &str, body: Body| {
-                town.said(Word::new(format!("town/residents/{name}"), Tense::Present, body), &s)
+            let say = |name: &str, body: Body, by: &Resident| {
+                town.said(Word::new(format!("town/residents/{name}"), Tense::Present, body), by)
             };
-            let mut heard = Vec::new();
-            let to = async |w: &Word| {
-                if w.is_now() {
-                    // it already hears `s`; `x/` is new, and so is `y`, from one that comes after
-                    say("a", it(serde_json::json!(["s", "x/"])));
-                    say("b", it(serde_json::json!(["x/", "y"])));
-                    town.talk(Word::new("x/1", Tense::Present, Body::of("after")));
-                    town.talk(Word::new("s", Tense::Past, Body::of("end")));
-                }
-                if w.body == Body::of("end") {
-                    return Err(std::io::ErrorKind::BrokenPipe.into());
-                }
-                heard.push(w.body.clone());
-                Ok(true)
+            let past = |kind: &str, body: &str| {
+                town.talk(Word::new(kind, Tense::Past, Body::of(body)));
             };
-            tell(&town, &s, s.listening(&town), to).await;
-            let want = ["mine", "", "one", "two", "why", "after"];
-            let want: Vec<Body> =
-                want.map(|b| if b.is_empty() { Body::none() } else { Body::of(b) }).into();
-            assert_eq!(heard, want, "the present it hears now, once, then what came after");
+            let then = || {
+                say("a", it(serde_json::json!(["x"])), &s);
+                let a = town.spoken_for(&s, "a").unwrap();
+                say("b", it(serde_json::json!(["x", "y"])), &a);
+                past("x", "two");
+                past("y", "why");
+                say("a", Body::none(), &s);
+                past("x", "three");
+                past("s", "end");
+            };
+            let heard = told_for(&town, &s, s.listening(&town), then).await;
+            let by = |name: &str| Some(name.to_string());
+            let want = [
+                ("s", Body::of("mine"), None),
+                ("", Body::none(), None),
+                ("x", Body::of("one"), by("a")),
+                ("", Body::none(), by("a")),
+                ("x", Body::of("one"), by("a/b")),
+                ("", Body::none(), by("a/b")),
+                ("x", Body::of("two"), by("a")),
+                ("x", Body::of("two"), by("a/b")),
+                ("y", Body::of("why"), by("a/b")),
+            ];
+            let want: Vec<_> = want.into_iter().map(|(k, b, by)| (k.to_string(), b, by)).collect();
+            assert_eq!(heard, want, "each for each that hears it, and none once gone");
         });
     }
 
-    // one a speaker comes to speak for before it is told: what it hears for it is in the present it
-    // is greeted with, once
+    // one a speaker comes to speak for before it is told is greeted all the same, after the
+    // speaker's own present
     #[test]
-    fn a_speaker_not_yet_told_is_greeted_with_what_those_it_speaks_for_hear() {
+    fn a_speaker_not_yet_told_is_greeted_for_those_it_speaks_for() {
         run(async {
             let dir = scratch();
             let town = Town::with_log(dir.log());
@@ -889,19 +1010,15 @@ mod tests {
             let words = s.listening(&town);
             let body = Body::of(serde_json::json!({ "kinds": ["x"] }));
             town.said(Word::new("town/residents/a", Tense::Present, body), &s);
-            let mut heard = Vec::new();
-            let to = async |w: &Word| {
-                if w.is_now() {
-                    town.talk(Word::new("s", Tense::Past, Body::of("end")));
-                }
-                if w.body == Body::of("end") {
-                    return Err(std::io::ErrorKind::BrokenPipe.into());
-                }
-                heard.push(w.body.clone());
-                Ok(true)
-            };
-            tell(&town, &s, words, to).await;
-            assert_eq!(heard, [Body::of("one"), Body::none()], "once, in the present");
+            let end = || town.talk(Word::new("s", Tense::Past, Body::of("end")));
+            let heard = told_for(&town, &s, words, end).await;
+            let a = Some("a".to_string());
+            let want = [
+                ("".into(), Body::none(), None),
+                ("x".into(), Body::of("one"), a.clone()),
+                ("".into(), Body::none(), a),
+            ];
+            assert_eq!(heard, want, "its own present, then the greeting");
         });
     }
 
@@ -986,8 +1103,14 @@ mod tests {
             of(&x).unwrap_err(),
             "a word has no `x`: it is `kind`, `tense`, `body` and `when`"
         );
-        assert!(word_at("", &Parts::map([("tense", "past")])).is_err(), "at the root, a kind");
-        assert_eq!(word_at("box", &Parts::map([("tense", "past")])).unwrap().kind, "box");
+        let at_root = Parts::map([("tense", "past".into()), ("body", Parts::from("x"))]);
+        assert!(word_at("", &at_root).is_err(), "at the root, a kind");
+        assert!(word_at("", &Parts::map([("tense", "past")])).unwrap().is_now(), "but `now`");
+        // at a join, `""` is its kind; but a past word there with no body is `now`, as it is told
+        let at_box =
+            |p: Parts| word_at("box", &Parts::map([("tense", "past".into()), ("body", p)]));
+        assert_eq!(at_box(Parts::from("x")).unwrap().kind, "box");
+        assert!(at_box(Parts::None).unwrap().is_now(), "`now`, wherever it is said");
         // `by` is what a resident says of a word, not the word: read anywhere else, it is refused
         assert!(read(r#"{"kind":"a","by":"sub"}"#).unwrap_err().contains("no `by`"));
         let by = Parts::map([("kind", Parts::from("a")), ("by", Parts::from("sub"))]);
@@ -1013,22 +1136,22 @@ mod tests {
         });
     }
 
-    // a line is at most `MOST`: what is past it is let go, to its end, and the next is heard
+    // a line is whole, however long, and the next is heard
     #[test]
-    fn a_line_is_at_most_most() {
+    fn a_line_is_whole() {
         run(async {
-            let mut said = vec![b'a'; MOST + 10];
+            let mut said = vec![b'a'; 1 << 20];
             said.extend_from_slice(b"\nnext\n");
             let mut voice = Voice::new(&said[..]);
-            assert_eq!(voice.next().await.map(|l| l.len()), Some(MOST));
+            assert_eq!(voice.next().await.map(|l| l.len()), Some(1 << 20));
             assert_eq!(voice.next().await.as_deref(), Some("next"));
             assert_eq!(voice.next().await, None);
         });
     }
 
     // a unit that comes in many pieces is read again only as what is held grows by half, not for
-    // each piece, so its reads cost what a few of it whole would; and one that comes and stops is
-    // read, though less came than was waited for
+    // each piece that has come, so its reads cost what a few of it whole would; and one that comes
+    // and stops is read, though less came than was waited for
     #[test]
     fn a_unit_is_read_again_as_it_grows() {
         run(async {
@@ -1036,7 +1159,7 @@ mod tests {
             let line = crate::language::Grammar::of(&Parts::map([("upto", "\n")])).unwrap();
             languages.say("line", line);
             let (mut to, from) = tokio::io::duplex(256);
-            let said = MOST - 1;
+            let said = 64 * 1024 - 1;
             tokio::task::spawn_local(async move {
                 for _ in 0..said / 64 {
                     to.write_all(&[b'a'; 64]).await.unwrap();
@@ -1055,8 +1178,8 @@ mod tests {
         });
     }
 
-    // in a language not JSON, a unit that is no word is said as the bytes it was read from, as
-    // `town ask` knows its own by
+    // in a language not JSON, a unit that is no word is said as the bytes it was read from, so
+    // the one who said it knows it
     #[test]
     fn a_unit_that_is_no_word_is_said_as_it_came() {
         run(async {

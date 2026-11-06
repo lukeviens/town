@@ -3,7 +3,8 @@
 -- `join` starts a program and keeps talking to it. `cat` speaks `line`: each line it prints
 -- comes back as a past word of its kind, here `cat`, and each future `cat` is sent to it as a line.
 --
---   town talk future say text=hi     `cat` says hi back: a past `echoed`
+--   printf 'future\tsay\ttext=hi\n' | town '{"speaks":"words"}'
+--                                  `cat` says hi back: a past `echoed`
 
 local echo = react{
   on({ kind = "say", tense = "future" }, function(w)

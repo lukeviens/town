@@ -1,12 +1,13 @@
--- reload: opens a resident again as it is saved. It joins town's `WATCH` on each path in
--- `town/residents` but one inside another, which that one's watch holds, and asks `town/open` of
--- each file a watch says changed, or is gone: town opens each once the opens of one save stop, if
--- the file is a resident, or was one. What a watch says as it begins, before its `now`, is every
--- file there: of those, only one changed since reload began, as the town read it, is asked.
+-- reload: opens a resident again as it is saved. It joins `mirror` on each path in
+-- `town/residents` but one inside another, which that one's mirror says, and asks `town/open` of
+-- each file a mirror says, or says is gone. Town opens again only a file that is not the version
+-- its opener opened, so an ask of one as it was, as a mirror begins or town lets a fact go, does
+-- nothing. So it asks of every file it is told, its greeting too: a file's kind is
+-- `reload<its path>`, whichever mirror said it, and one said before it knew its mirrors, or said
+-- again unchanged, is still asked of.
 local hears = hears   -- town's rule, as it is now: a library after may name its own
-local watching = {}   -- each watch, by its kind: whether it has said `now`
-local began = (os.time() - 1) * 1e9   -- in ns, as a watch says when a file changed
-local function inside(path, paths)   -- whether another of the paths holds it
+local mirrors = {}    -- each mirror it joined, by its kind
+local function inside(path, paths)   -- whether another of the paths contains it
   for _, other in ipairs(paths) do
     if other ~= path and hears("/reload" .. other, "reload" .. path) then return true end
   end
@@ -16,27 +17,19 @@ return {
   kinds = { "town/residents", "/reload" },
   listen = function(w)
     if w.kind == "town/residents" then
-      if not WATCH then error("town gives no WATCH, so there is no watch to join") end
-      watching = {}
+      mirrors = {}
       local paths = w.body or {}
       for _, path in ipairs(paths) do
         local kind = "reload" .. path
-        if not inside(path, paths) and watching[kind] == nil then
-          watching[kind] = false
-          talk(join(kind, { WATCH, path }))
+        if not inside(path, paths) and not mirrors[kind] then
+          mirrors[kind] = true
+          talk(join(kind, { "mirror", path }))
         end
       end
       return
     end
-    for at, now in pairs(watching) do
-      if w.kind == at and w.tense == "past" and w.body == nil then
-        watching[at] = true   -- its `now`: what it says from here on changed as it watched
-        return
-      end
-      local changed = type(w.body) == "table" and w.body.changed or 0
-      if w.tense == "present" and hears("/" .. at, w.kind) and (now or changed >= began) then
-        return intent("town/open", { path = w.kind:sub(#"reload" + 1) })
-      end
+    if w.tense == "present" and w.kind:sub(1, #"reload/") == "reload/" then
+      return intent("town/open", { path = w.kind:sub(#"reload" + 1) })
     end
   end,
 }

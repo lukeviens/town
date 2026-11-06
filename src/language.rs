@@ -7,7 +7,7 @@
 //!   resident waits for the rest of a word rather than taking half of one.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::Deserialize;
@@ -31,8 +31,8 @@ pub enum Read {
 }
 
 impl Language {
-    /// The first of what `bytes` hold, in this language: JSON a line at a time, a grammar as far as
-    /// it reads. `ended` once no more will come.
+    /// The first of what `bytes` contain, in this language: JSON a line at a time, a grammar as far
+    /// as it reads. `ended` once no more will come.
     pub fn read(&self, bytes: &[u8], ended: bool, languages: &Languages) -> Read {
         match self {
             Language::Json => {
@@ -45,7 +45,7 @@ impl Language {
                     None if ended => return Read::No(bytes.len()),
                     None => return Read::More(bytes.len() + 1),
                 };
-                match serde_json::from_slice(line) {
+                match crate::parts::json(line) {
                     Ok(p) => Read::Got(p, took),
                     Err(_) => Read::No(took),
                 }
@@ -57,7 +57,7 @@ impl Language {
     /// all of `bytes`, as parts; nothing if they are not of this language
     pub fn parts(&self, bytes: &[u8], languages: &Languages) -> Option<Parts> {
         match self {
-            Language::Json => serde_json::from_slice(bytes).ok(),
+            Language::Json => crate::parts::json(bytes).ok(),
             Language::Grammar(g) => match g.read_from(bytes, true, languages) {
                 Read::Got(p, n) if n == bytes.len() => Some(p),
                 _ => None,
@@ -74,14 +74,19 @@ impl Language {
                 b
             }),
             Language::Grammar(g) => {
-                let mut w = Writer { out: Vec::new(), languages, deep: 0, writing: Vec::new() };
+                let mut w = Writer {
+                    out: Vec::new(),
+                    languages,
+                    writing: HashSet::new(),
+                    made: HashSet::new(),
+                };
                 g.write(parts, true, &mut w).then_some(w.out)
             }
         }
     }
 }
 
-/// JSON's own values, as the parts they hold
+/// JSON's own values, as the parts they contain
 impl From<serde_json::Value> for Parts {
     fn from(v: serde_json::Value) -> Parts {
         Parts::deserialize(v).unwrap_or_default()
@@ -146,9 +151,6 @@ impl Languages {
     }
 }
 
-/// How deep a language may name another, or parts hold parts: either may go on without end.
-pub const DEEP: usize = 128;
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Grammar {
     /// these bytes; named, they are kept
@@ -171,7 +173,7 @@ pub enum Grammar {
     Unless(Box<Grammar>),
     /// a whole number
     Int(Int),
-    /// a number of 2, 4 or 8 bytes, as IEEE 754 holds it
+    /// a number of 2, 4 or 8 bytes, as IEEE 754 writes it
     Float(usize, bool),
     /// text of as many bytes as the count says
     Text(Count),
@@ -219,7 +221,7 @@ pub enum Count {
 }
 
 /// A whole number of `size` bytes, its first byte the most or, `little`, the least: `from` to `to`
-/// as the bytes hold it, and read as that less `base`; or, `negative`, as `base` less that.
+/// as the bytes write it, and read as that less `base`; or, `negative`, as `base` less that.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Int {
     size: usize,
@@ -253,12 +255,11 @@ struct Reader<'a> {
     b: &'a [u8],
     ended: bool,
     languages: &'a Languages,
-    deep: usize,
     /// the whole numbers named so far in the seqs being read, for a count that names one
     known: Vec<(String, usize)>,
     /// the languages being read, and where: one named again where it is already being read reads
-    /// nothing, so a language that begins with itself ends
-    reading: Vec<(*const Grammar, usize)>,
+    /// nothing, so a language that begins with itself ends. Each is found at once, however deep
+    reading: HashSet<(*const Grammar, usize)>,
     /// as far as any piece began to read
     far: usize,
 }
@@ -266,9 +267,13 @@ struct Reader<'a> {
 struct Writer<'a> {
     out: Vec<u8>,
     languages: &'a Languages,
-    deep: usize,
-    /// the languages being written, and of what: one named again for the same part writes nothing
-    writing: Vec<(*const Grammar, *const Parts)>,
+    /// the languages being written, and where: one named again within itself before it has written
+    /// a byte would write without end, whatever parts it is given, so it writes nothing
+    writing: HashSet<(*const Grammar, usize)>,
+    /// the pairs each map made as it writes, `{ key, value }`, by the map: one given back its own
+    /// would make one like it, and write without end, a byte or more each time, so it writes
+    /// nothing. Another map may write it, as a map of maps does
+    made: HashSet<(*const Grammar, *const Parts)>,
 }
 
 impl Grammar {
@@ -283,6 +288,10 @@ impl Grammar {
 
     /// a grammar as parts, its counts not yet looked at
     fn made(p: &Parts) -> Result<Grammar, String> {
+        crate::parts::deep(|| Grammar::making(p))
+    }
+
+    fn making(p: &Parts) -> Result<Grammar, String> {
         let one = match p {
             Parts::Map(m) if m.len() == 1 => &m[0],
             _ => return Err(format!("a grammar is one of {}", PIECES.join(", "))),
@@ -357,16 +366,15 @@ impl Grammar {
         })
     }
 
-    /// The first of what `bytes` hold, as far as this grammar reads them.
+    /// The first of what `bytes` contain, as far as this grammar reads them.
     fn read_from(&self, bytes: &[u8], ended: bool, languages: &Languages) -> Read {
         let (mut r, mut at) = (
             Reader {
                 b: bytes,
                 ended,
                 languages,
-                deep: 0,
                 known: Vec::new(),
-                reading: Vec::new(),
+                reading: HashSet::new(),
                 far: 0,
             },
             0,
@@ -381,6 +389,11 @@ impl Grammar {
     /// What is read from `at`, which it moves past. A grammar that does not read leaves `at` for
     /// whoever tries next to put back.
     fn read(&self, r: &mut Reader, at: &mut usize) -> R {
+        // however deep what it reads is: each step in grows the stack as it must
+        crate::parts::deep(|| self.reading(r, at))
+    }
+
+    fn reading(&self, r: &mut Reader, at: &mut usize) -> R {
         r.far = r.far.max(*at);
         let rest = &r.b[*at..];
         // so many bytes, if there are so many; or more to wait for
@@ -444,14 +457,15 @@ impl Grammar {
                             r.known.push((name.clone(), n));
                         }
                     }
-                    match (item, v) {
+                    match (item, &v) {
                         (Grammar::Lit(_) | Grammar::Unless(_), _) => {}
-                        (_, Parts::Map(p)) => {
+                        (_, Parts::Map(_)) => {
                             let parts = parts.get_or_insert(Parts::Map(Vec::new()));
+                            let p = v.into_map().unwrap_or_default();
                             p.into_iter().for_each(|(n, v)| parts.set(n, v));
                         }
                         (_, Parts::None) => {}
-                        (_, v) => lone.push(v),
+                        _ => lone.push(v),
                     }
                 }
                 r.known.truncate(known);
@@ -460,8 +474,9 @@ impl Grammar {
                 if let Some(p) = parts.as_mut() {
                     shape.counts.iter().for_each(|n| p.remove(n));
                 }
+                let none = matches!(&parts, Some(Parts::Map(m)) if m.is_empty());
                 R::Got(match (parts, lone.len()) {
-                    (Some(Parts::Map(m)), 1) if m.is_empty() => lone.remove(0),
+                    (Some(_), 1) if none => lone.remove(0),
                     (Some(parts), _) if shape.kept => parts,
                     (_, 1) => lone.remove(0),
                     _ => Parts::None,
@@ -557,13 +572,13 @@ impl Grammar {
                 got!(g.read(r, at));
                 R::Got(v.clone())
             }
-            Grammar::Whole(g) => match got!(g.read(r, at)) {
-                Parts::List(pieces) => {
+            Grammar::Whole(g) => match got!(g.read(r, at)).into_list() {
+                Some(pieces) => {
                     let mut all = Vec::new();
                     let mut text = true;
-                    for p in pieces {
+                    for p in &pieces {
                         match p {
-                            Parts::Text(t) => all.extend(t.into_bytes()),
+                            Parts::Text(t) => all.extend(t.as_bytes()),
                             Parts::Bytes(b) => {
                                 all.extend(b);
                                 text = false;
@@ -573,20 +588,17 @@ impl Grammar {
                     }
                     R::Got(if text { self::text(&all) } else { Parts::Bytes(all) })
                 }
-                _ => R::No,
+                None => R::No,
             },
             Grammar::Ref(name) => {
                 let Ok(f) = r.languages.get(name) else { return R::No };
                 let Language::Grammar(g) = &*f else { return R::No };
                 let here = (g as *const Grammar, *at);
-                if r.deep >= DEEP || r.reading.contains(&here) {
+                if !r.reading.insert(here) {
                     return R::No;
                 }
-                r.deep += 1;
-                r.reading.push(here);
                 let read = g.read(r, at);
-                r.reading.pop();
-                r.deep -= 1;
+                r.reading.remove(&here);
                 read
             }
         }
@@ -596,6 +608,10 @@ impl Grammar {
     /// the parts around it, as a seq's pieces are given. One that could not leaves what it wrote
     /// for whoever tries next to take back.
     fn write(&self, v: &Parts, is: bool, w: &mut Writer) -> bool {
+        crate::parts::deep(|| self.writing(v, is, w))
+    }
+
+    fn writing(&self, v: &Parts, is: bool, w: &mut Writer) -> bool {
         match self {
             // itself: as a part, only for nothing or itself
             Grammar::Lit(s) => {
@@ -660,11 +676,18 @@ impl Grammar {
             },
             Grammar::Map(g, n) => {
                 let Parts::Map(m) = v else { return false };
+                let me = self as *const Grammar;
+                if w.made.contains(&(me, v as *const Parts)) {
+                    return false;
+                }
                 n.as_ref().is_none_or(|n| n.write(m.len(), w))
                     && m.iter().all(|(k, v)| {
                         let pair =
                             Parts::map([("key", Parts::from(k.as_str())), ("value", v.clone())]);
-                        g.write(&pair, false, w)
+                        w.made.insert((me, &pair as *const Parts));
+                        let wrote = g.write(&pair, false, w);
+                        w.made.remove(&(me, &pair as *const Parts));
+                        wrote
                     })
             }
             Grammar::Unless(_) => true,
@@ -706,15 +729,12 @@ impl Grammar {
             Grammar::Ref(name) => {
                 let Ok(f) = w.languages.get(name) else { return false };
                 let Language::Grammar(g) = &*f else { return false };
-                let here = (g as *const Grammar, v as *const Parts);
-                if w.deep >= DEEP || w.writing.contains(&here) {
+                let here = (g as *const Grammar, w.out.len());
+                if !w.writing.insert(here) {
                     return false;
                 }
-                w.deep += 1;
-                w.writing.push(here);
                 let wrote = g.write(v, is, w);
-                w.writing.pop();
-                w.deep -= 1;
+                w.writing.remove(&here);
                 wrote
             }
         }
@@ -795,7 +815,7 @@ impl Int {
         })
     }
 
-    /// the number read, of what the bytes hold
+    /// the number read, of what the bytes write
     fn read(&self, held: i128) -> i128 {
         match self.negative {
             true => self.base - held,
@@ -803,7 +823,7 @@ impl Int {
         }
     }
 
-    /// what the bytes hold, of the number
+    /// what the bytes write, of the number
     fn held_for(&self, n: i128) -> i128 {
         match self.negative {
             true => self.base - n,
@@ -811,7 +831,7 @@ impl Int {
         }
     }
 
-    /// the number the bytes hold
+    /// the number the bytes write
     fn held(&self, bytes: &[u8]) -> i128 {
         let mut b = [0u8; 16];
         let pad = if self.signed
@@ -829,7 +849,7 @@ impl Int {
         i128::from_le_bytes(b)
     }
 
-    /// the bytes that hold the number
+    /// the bytes that write the number
     fn bytes(&self, held: i128) -> Vec<u8> {
         let mut b = held.to_le_bytes()[..self.size].to_vec();
         if !self.little {
@@ -890,6 +910,10 @@ impl Grammar {
     /// Whether each count that names a part names one read before it in the same seq, `before`
     /// this piece: one that names none would write what cannot be read back.
     fn counts(&self, before: Option<&[Grammar]>) -> Result<(), String> {
+        crate::parts::deep(|| self.counting(before))
+    }
+
+    fn counting(&self, before: Option<&[Grammar]>) -> Result<(), String> {
         if let Some(n) = self.count_name() {
             let part = |g: &Grammar| matches!(g, Grammar::Part(name, _) if name == n);
             if !before.is_some_and(|b| b.iter().any(part)) {
@@ -955,7 +979,7 @@ fn said(v: &Parts) -> Option<String> {
     }
 }
 
-/// a whole number, as a part holds it
+/// a whole number, as a part says it
 fn whole(p: &Parts) -> Option<i128> {
     let Parts::Number(n) = p else { return None };
     n.parse::<i128>().ok().or_else(|| {
@@ -976,7 +1000,7 @@ fn little(p: &Parts) -> Result<bool, String> {
     }
 }
 
-/// a number of 2 bytes, as IEEE 754 holds it
+/// a number of 2 bytes, as IEEE 754 writes it
 fn half(h: u16) -> f64 {
     let (sign, exp, frac) = ((h >> 15) as i32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f64);
     let x = match exp {
@@ -992,7 +1016,7 @@ fn half(h: u16) -> f64 {
     }
 }
 
-/// a number in 2 bytes, if they hold it exactly
+/// a number in 2 bytes, if they say it exactly
 fn unhalf(x: f64) -> Option<u16> {
     let sign = if x.is_sign_negative() { 0x8000 } else { 0 };
     let a = x.abs();
@@ -1055,6 +1079,59 @@ mod tests {
             ] },
             { "upto": "\n" },
         ] } }))
+    }
+
+    // a language that comes to itself before it writes a byte is a loop, refused as it loops: a
+    // map of itself, given a map, writes nothing rather than without end
+    #[test]
+    fn a_language_that_writes_itself_ends() {
+        let languages = Languages::default();
+        let m = grammar(json!({ "map": { "ref": "m" } }));
+        languages.say("m", m.clone());
+        let body = parts(json!({ "a": { "b": 1 } }));
+        assert_eq!(Language::Grammar(m).bytes(&body, &languages), None, "nothing, at once");
+        // nor one that writes a byte each time it comes to a pair it made itself
+        let x = grammar(json!({ "map": { "seq": [{ "lit": "x" }, { "ref": "x" }] } }));
+        languages.say("x", x.clone());
+        assert_eq!(Language::Grammar(x).bytes(&body, &languages), None, "nothing, and it ends");
+        // but one that writes what a pair holds, its `value`, writes it, however deep
+        let o = grammar(json!({ "choice": [
+            { "map": { "seq": [{ "lit": "(" }, { "part": ["value", { "ref": "o" }] }] } },
+            { "be": [{ "lit": "1" }, 1] },
+        ] }));
+        languages.say("o", o.clone());
+        assert_eq!(Language::Grammar(o).bytes(&body, &languages), Some(b"((1".to_vec()));
+        // and a map of maps writes each pair as a map, as it is no map's own
+        let pairs = grammar(json!({ "map": { "map": { "lit": "p" } } }));
+        let flat = parts(json!({ "a": 1 }));
+        assert_eq!(Language::Grammar(pairs).bytes(&flat, &languages), Some(b"pp".to_vec()));
+    }
+
+    // what is held in what is held, however deep, is read, written, and let go as any is: town
+    // sets no depth, and a grammar that comes to itself does not end it
+    #[test]
+    fn what_is_held_however_deep_is_read() {
+        let languages = Languages::default();
+        let nested = grammar(json!({ "choice": [
+            { "seq": [{ "lit": "[" }, { "part": ["in", { "ref": "nested" }] }, { "lit": "]" }] },
+            { "lit": "x" },
+        ] }));
+        languages.say("nested", nested.clone());
+        // deeper than a test's stack allows, a step at a time
+        let deep = 20_000;
+        let bytes = [vec![b'['; deep], vec![b'x'], vec![b']'; deep]].concat();
+        let read = Language::Grammar(nested.clone()).parts(&bytes, &languages);
+        assert!(read.is_some(), "read, however deep");
+        let bytes = Language::Grammar(nested).bytes(&read.unwrap(), &languages);
+        assert_eq!(bytes.map(|b| b.len()), Some(2 * deep + 1), "and written back");
+        let mut held = Parts::None;
+        for _ in 0..deep {
+            held = Parts::List(vec![held]);
+        }
+        let again = held.clone();
+        assert!(again == held, "compared");
+        assert!(serde_json::to_string(&held).is_ok(), "said");
+        drop((held, again));
     }
 
     // kv reads lines of key=value, passing over the rest, and a last line without its end

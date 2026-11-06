@@ -1,6 +1,6 @@
-//! Parts: what a body holds, in town's own terms: nothing, text, bytes, a number, true or false, a
-//! list, or parts by name. A language reads bytes as parts and writes parts as bytes, each its own
-//! way.
+//! Parts: what a body contains, in town's own terms: nothing, text, bytes, a number, true or false,
+//! a list, or parts by name. A language reads bytes as parts and writes parts as bytes, each its
+//! own way.
 
 use std::fmt;
 
@@ -8,7 +8,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub enum Parts {
     #[default]
     None,
@@ -21,6 +21,68 @@ pub enum Parts {
     List(Vec<Parts>),
     /// parts by name, in the order they came
     Map(Vec<(String, Parts)>),
+}
+
+/// A step into what parts contain, however deep: the stack grows as it must, on the heap, so parts
+/// as deep as memory allows are walked as any are, and none is too deep.
+pub fn deep<R>(step: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, step)
+}
+
+/// What JSON says, however deep: read with no depth of serde_json's own, as each step into parts
+/// grows the stack as it must (`deep`), and serde_json passes over what it keeps whole, a word's
+/// body, without a step.
+pub fn json<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> serde_json::Result<T> {
+    let mut read = serde_json::Deserializer::from_slice(bytes);
+    read.disable_recursion_limit();
+    let it = T::deserialize(&mut read)?;
+    read.end()?;
+    Ok(it)
+}
+
+impl Clone for Parts {
+    fn clone(&self) -> Parts {
+        deep(|| match self {
+            Parts::None => Parts::None,
+            Parts::Text(t) => Parts::Text(t.clone()),
+            Parts::Bytes(b) => Parts::Bytes(b.clone()),
+            Parts::Number(n) => Parts::Number(n.clone()),
+            Parts::Bool(b) => Parts::Bool(*b),
+            Parts::List(l) => Parts::List(l.clone()),
+            Parts::Map(m) => Parts::Map(m.clone()),
+        })
+    }
+}
+
+impl fmt::Debug for Parts {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        deep(|| match self {
+            Parts::None => f.write_str("None"),
+            Parts::Text(t) => f.debug_tuple("Text").field(t).finish(),
+            Parts::Bytes(b) => f.debug_tuple("Bytes").field(b).finish(),
+            Parts::Number(n) => f.debug_tuple("Number").field(n).finish(),
+            Parts::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            Parts::List(l) => f.debug_tuple("List").field(l).finish(),
+            Parts::Map(m) => f.debug_tuple("Map").field(m).finish(),
+        })
+    }
+}
+
+/// Let go without a step for each that is in another: what each contains is taken out first,
+/// so parts however deep go as flat ones do.
+impl Drop for Parts {
+    fn drop(&mut self) {
+        let held = |p: &mut Parts, into: &mut Vec<Parts>| match p {
+            Parts::List(l) => into.append(l),
+            Parts::Map(m) => into.extend(m.drain(..).map(|(_, p)| p)),
+            _ => {}
+        };
+        let mut going = Vec::new();
+        held(self, &mut going);
+        while let Some(mut p) = going.pop() {
+            held(&mut p, &mut going);
+        }
+    }
 }
 
 impl Parts {
@@ -78,6 +140,22 @@ impl Parts {
         }
     }
 
+    /// the list these are, taken, for one that owns them
+    pub fn into_list(mut self) -> Option<Vec<Parts>> {
+        match &mut self {
+            Parts::List(l) => Some(std::mem::take(l)),
+            _ => None,
+        }
+    }
+
+    /// the parts by name these are, taken, for one that owns them
+    pub fn into_map(mut self) -> Option<Vec<(String, Parts)>> {
+        match &mut self {
+            Parts::Map(m) => Some(std::mem::take(m)),
+            _ => None,
+        }
+    }
+
     pub fn list(&self) -> Option<&[Parts]> {
         match self {
             Parts::List(l) => Some(l),
@@ -89,19 +167,39 @@ impl Parts {
 /// The same parts: by name in any order, and a number by what it is, not how it is written.
 impl PartialEq for Parts {
     fn eq(&self, other: &Parts) -> bool {
-        match (self, other) {
+        deep(|| match (self, other) {
             (Parts::None, Parts::None) => true,
             (Parts::Text(a), Parts::Text(b)) => a == b,
             (Parts::Bytes(a), Parts::Bytes(b)) => a == b,
-            (Parts::Number(a), Parts::Number(b)) => a == b || self.number() == other.number(),
+            (Parts::Number(a), Parts::Number(b)) => same_number(a, b),
             (Parts::Bool(a), Parts::Bool(b)) => a == b,
             (Parts::List(a), Parts::List(b)) => a == b,
             (Parts::Map(a), Parts::Map(b)) => {
                 a.len() == b.len() && a.iter().all(|(n, p)| other.get(n) == Some(p))
             }
             _ => false,
-        }
+        })
     }
+}
+
+/// Whether two numbers, as written, are the same number: two whole ones exactly, however big, so
+/// none is the same as its neighbour; any other by its value, so `1` is `1.0`.
+fn same_number(a: &str, b: &str) -> bool {
+    match (whole(a), whole(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b || a.parse::<f64>().ok().is_some_and(|x| b.parse::<f64>().ok() == Some(x)),
+    }
+}
+
+/// A whole number as written, by its sign and its digits, none leading: so `-0` is `0`, and `007`
+/// is `7`, however many digits. None if it is not whole.
+fn whole(n: &str) -> Option<(bool, &str)> {
+    let (minus, digits) = n.strip_prefix('-').map_or((false, n), |d| (true, d));
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    Some((minus && !digits.is_empty(), digits))
 }
 
 impl From<&str> for Parts {
@@ -147,7 +245,7 @@ impl From<f64> for Parts {
 /// parts as any serde language writes them: what the JSON language is built on
 impl Serialize for Parts {
     fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
-        match self {
+        deep(|| match self {
             Parts::None => to.serialize_unit(),
             Parts::Text(t) => to.serialize_str(t),
             Parts::Bytes(b) => to.serialize_bytes(b),
@@ -168,7 +266,7 @@ impl Serialize for Parts {
                 m.iter().try_for_each(|(n, p)| map.serialize_entry(n, p))?;
                 map.end()
             }
-        }
+        })
     }
 }
 
@@ -221,32 +319,67 @@ impl<'de> Visitor<'de> for Reading {
         Ok(Parts::Bytes(b))
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Parts, A::Error> {
-        let mut l = Vec::new();
-        while let Some(p) = seq.next_element()? {
-            l.push(p);
-        }
-        Ok(Parts::List(l))
+        deep(|| {
+            let mut l = Vec::new();
+            while let Some(p) = seq.next_element()? {
+                l.push(p);
+            }
+            Ok(Parts::List(l))
+        })
     }
     /// as `set` names each, the last of a name in the place of the first, but each found once, by
     /// where it is: however many parts, each costs the same
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Parts, A::Error> {
-        let (mut m, mut at) = (Vec::new(), std::collections::HashMap::new());
-        while let Some((n, p)) = map.next_entry::<String, Parts>()? {
-            match at.get(&n) {
-                Some(&i) => m[i] = (n, p),
-                None => {
-                    at.insert(n.clone(), m.len());
-                    m.push((n, p));
+        deep(|| {
+            let (mut m, mut at) = (Vec::new(), std::collections::HashMap::new());
+            while let Some((n, p)) = map.next_entry::<String, Parts>()? {
+                match at.get(&n) {
+                    Some(&i) => m[i] = (n, p),
+                    None => {
+                        at.insert(n.clone(), m.len());
+                        m.push((n, p));
+                    }
                 }
             }
-        }
-        Ok(Parts::Map(m))
+            Ok(Parts::Map(m))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // two whole numbers are the same only if they are, however big; a whole one and a fraction of
+    // one value are the same
+    #[test]
+    fn a_number_is_the_same_only_as_itself() {
+        let n = |t: &str| Parts::Number(t.into());
+        assert_ne!(n("9007199254740992"), n("9007199254740993"), "past where a float is exact");
+        assert_ne!(n("1793609215000000001"), n("1793609215000000002"), "as a file's ns are");
+        assert_eq!(n("1"), n("1.0"));
+        assert_eq!(n("12"), n("12"));
+        let big = "1".repeat(60);
+        assert_ne!(n(&format!("{big}1")), n(&format!("{big}2")), "past where i128 is");
+        assert_eq!(n(&format!("{big}1")), n(&format!("00{big}1")));
+        assert_eq!(n("-0"), n("0"));
+        assert_ne!(n("-7"), n("7"));
+    }
+
+    // JSON is read however deep, as a word and as its body, with no depth of serde_json's own
+    #[test]
+    fn json_is_read_however_deep() {
+        let deep = 20_000;
+        let body = format!("{}1{}", "[".repeat(deep), "]".repeat(deep));
+        let line = format!(r#"{{"kind":"deep","tense":"past","body":{body}}}"#);
+        let w = crate::voice::read(&line).expect("a word, however deep");
+        let mut parts = w.body.parts();
+        for _ in 0..deep {
+            parts = &parts.list().expect("a list in a list")[0];
+        }
+        assert_eq!(parts, &Parts::from(1i64), "all the way down");
+        assert!(json::<Parts>(body.as_bytes()).is_ok(), "and read as parts alone");
+    }
 
     // parts by name are the same in any order, a later one of a name takes the earlier's place,
     // and a number is what it is however it is written

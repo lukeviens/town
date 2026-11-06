@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 # town's own residents that are programs, built beside it
 [[bin]]
-name = "watch"
-path = "residents/watch.rs"
+name = "mirror"
+path = "residents/mirror.rs"
 
 [[bin]]
 name = "lua"
@@ -26,9 +26,10 @@ tokio = { version = "1", features = [
 ] }
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["raw_value", "unbounded_depth"] }
 notify = "6"
 libc = "0.2"
+stacker = "0.1.25"
 
 [features]
 # what tests are written with: here, and in a town's own tests, which name it

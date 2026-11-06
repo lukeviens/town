@@ -1,8 +1,9 @@
 -- msgpack: each value in its smallest form. A string is text, bin is bytes, an ext is
 -- { ext, data }.
 local value = ref("msgpack")
--- a count in a byte's low bits; in the bytes after b
+-- a count in a byte's low bits
 local function low(from, to) return int{ from = from, to = to, base = from } end
+-- a count in the `size` bytes after `b`
 local function after(b, size) return seq{ b, int{ size = size } } end
 -- an ext of a fixed size; of the size after b
 local kind = { ext = int{ signed = true } }

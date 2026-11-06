@@ -1,13 +1,10 @@
 //! What town is asked to do: its own futures, each answered in the past with how it went and what
 //! was sent with it. The README's *town*.
 //!
-//! - **`town/work`**: a command, run without holding up town.
-//! - **`town/after`**: a wait of `ms`.
-//! - **`town/join`**, **`town/connect`**: talk with a program, or a socket, at a kind, until it
-//!   ends.
+//! - **`town/work`**: a program, `argv`, run to its end without keeping town waiting.
+//! - **`town/join`**: talk with a program at a kind, until it ends.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -19,32 +16,23 @@ use crate::town::{Joined, Listening, Resident, Town};
 use crate::voice::{Life, Speaks, Voice};
 use crate::word::{is_kind, Tense, Word, KIND};
 
-/// A future `town/<verb>`, begun as `Town::talk` says it, so each is answered in the order asked,
-/// and a join hears what is wanted of it after. A `town/open` goes to the town's `Opening`, if it
-/// is kept, which settles each save and says it once. A `town/work` and a `town/after` are
-/// town's own, not a resident's: they outlive a reopen. A join or a connect is spoken for by `by`,
-/// who asked for it. A `town/read` is answered to `by` alone, into its own queue, as no other asked
-/// it; the rest are answered as words all may hear. Any other verb, a typo or what town says, is a
-/// `town/error`.
+/// What town is asked to do, by the verb of its want, `town/<verb>`: no other is.
+pub(crate) const VERBS: [&str; 4] = ["work", "join", "open", "read"];
+
+/// A want of town, `town/<verb>`, begun as it is said, so each is answered in the order asked. `by`
+/// asked for it. A work outlives a reopen, as town's own; a read is answered by the door alone.
 pub(crate) fn begin(town: &Rc<Town>, verb: &str, body: Body, by: u64) {
     let kind = format!("town/{verb}");
-    let fail = |why: String| town.error(&Resident::town(), Some(&kind), why);
+    // refused as the asker's own error, so one that asks as it answers an error is marked so
+    let asker = town.resident(by);
+    let fail = |why: String| town.error(&asker, Some(&kind), why);
     match verb {
-        "work" => match body.part("cmd").and_then(Parts::text).map(String::from) {
-            Some(cmd) => _ = tokio::task::spawn_local(done(town.clone(), cmd, body)),
-            None => fail("a work needs `cmd`, the command to run".into()),
+        "work" => match argv(&body) {
+            Ok(argv) => _ = tokio::task::spawn_local(done(town.clone(), argv, body)),
+            Err(why) => fail(format!("a work needs {why}")),
         },
-        // ms as any number: Lua's `/` makes a float of every division. A clock takes none below 0,
-        // and none too big to count
-        "after" => {
-            let ms = body.part("ms").and_then(Parts::number);
-            match ms.and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok()) {
-                Some(wait) => _ = tokio::task::spawn_local(waited(town.clone(), wait, body)),
-                None => fail("a wait needs ms: 0 or more".into()),
-            }
-        }
-        "join" | "connect" => {
-            if let Err(why) = join(town, verb, body, by) {
+        "join" => {
+            if let Err(why) = join(town, body, by) {
                 fail(why);
             }
         }
@@ -54,51 +42,36 @@ pub(crate) fn begin(town: &Rc<Town>, verb: &str, body: Body, by: u64) {
                 opening.ask(town, &body);
             }
         }
-        "read" => match read(town, &body) {
-            // to the asker alone: what it reads is its own
-            Ok(answer) => town.tell(by, Word::new("town/read", Tense::Past, answer)),
-            Err(why) => fail(why),
-        },
+        // a resident's want of another is refused at the door; this is town's own, said past it
         _ => fail(format!("town has no `{verb}`")),
     }
 }
 
-/// What a kind is joined to: a program it runs, or a socket it reaches, a path or a host:port.
-enum Reach {
-    Run(Vec<String>),
-    At(String),
+/// The program a work or a join runs, `argv`: its name, or its path, then what it is given, each
+/// text, or a number as the text it is written as, `sleep 5`. Else what it needs.
+fn argv(body: &Body) -> Result<Vec<String>, String> {
+    let text = |p: &Parts| match p {
+        Parts::Text(t) | Parts::Number(t) => Some(t.clone()),
+        _ => None,
+    };
+    let argv = body.part("argv").and_then(Parts::list).ok_or("`argv`, the program to run")?;
+    let argv = argv.iter().map(text).collect::<Option<Vec<_>>>();
+    let argv = argv.ok_or("an `argv` of text and numbers")?;
+    Some(argv).filter(|argv| !argv.is_empty()).ok_or("an `argv` that names a program".into())
 }
 
-/// Join a program, or connect a socket, as a resident at the kind `as`, owning it and what is under
+/// Join a program as a resident at the kind `as`, owning it and what is under
 /// it while it runs. It speaks `speaks`, or JSON; its kinds are paths from `as`: `a/b` is
 /// `as/a/b`, and none is `as`. One a resident asks for, numbered `by`, is under its place, spoken
 /// for by it, so it goes as that one goes. Joining a kind again ends the one before, as a reopen
 /// does. Why it cannot begin, if it cannot.
-fn join(town: &Rc<Town>, verb: &str, body: Body, by: u64) -> Result<(), String> {
+fn join(town: &Rc<Town>, body: Body, by: u64) -> Result<(), String> {
     let kind = body.part("as").and_then(Parts::text).map(String::from);
     if let Some(kind) = kind.as_deref().filter(|k| !is_kind(k)) {
         return Err(format!("`{kind}` is no kind: {KIND}"));
     }
-    let reach = match verb {
-        // a number in it is the text it is written as: `sleep 5`
-        "join" => match body.part("argv").and_then(Parts::list) {
-            Some(l) => {
-                let text = |p: &Parts| match p {
-                    Parts::Text(t) | Parts::Number(t) => Some(t.clone()),
-                    _ => None,
-                };
-                let argv = l.iter().map(text).collect::<Option<Vec<_>>>();
-                let argv = argv.ok_or("an `argv` is text and numbers")?;
-                Some(argv).filter(|argv| !argv.is_empty()).map(Reach::Run)
-            }
-            None => None,
-        },
-        _ => body.part("to").and_then(Parts::text).map(|to| Reach::At(to.into())),
-    };
-    let (Some(kind), Some(reach)) = (kind, reach) else {
-        let needs = if verb == "join" { "`argv` to run" } else { "`to`, a path or a host:port" };
-        return Err(format!("a {verb} needs `as`, and {needs}"));
-    };
+    let kind = kind.ok_or("a join needs `as`, the kind it stands at")?;
+    let argv = argv(&body).map_err(|why| format!("a join needs {why}"))?;
     // town's own words mean what town makes them mean: a program cannot speak as one
     if crate::town::towns(&kind) {
         return Err(format!("`{kind}` is town's own"));
@@ -115,35 +88,41 @@ fn join(town: &Rc<Town>, verb: &str, body: Body, by: u64) -> Result<(), String> 
     };
     // one that cannot come to its kind, or own it, cannot say what is there: it ends as it begins,
     // and the one before stays; it is answered, as any join is as it ends
-    let before = town.joins.borrow().get(&kind).map(|j| j.who.id);
-    if let Err(e) = town.may_come(&who, before) {
+    let refused = |e: String| {
         town.error(&who, Some(&kind), e.clone());
-        let body = answered(body, |m| {
+        let body = answered(body.clone(), |m| {
             m.set("code", -1i64);
             m.set("out", e);
         });
-        town.talk(Word::new(format!("town/{verb}"), Tense::Past, body));
-        return Ok(());
+        town.talk(Word::new("town/join", Tense::Past, body));
+        Ok(())
+    };
+    // a kind joined is its asker's: it may join there again, and none else may take it
+    let before = town.joins.borrow().get(&kind).map(|j| (j.who.id, j.who.by));
+    if before.is_some_and(|(_, by)| by != who.by) {
+        return refused(format!("`{kind}` is joined by another"));
     }
-    // the one before ends, and lets go, so this one owns its kind in its place
-    // taken out, then let go, so what its going says finds `joins` free to look at
+    if let Err(e) = town.may_come(&who, before.map(|(id, _)| id)) {
+        return refused(e);
+    }
+    // the one before is taken out, then let go, so this one owns its kind in its place, and what
+    // its going says finds `joins` free to look at
     let before = town.joins.borrow_mut().remove(&kind);
     drop(before);
     let here = match town.come(&who) {
         Ok(here) => here,
-        Err(e) => {
-            town.error(&who, Some(&kind), e);
-            return Ok(());
-        }
+        Err(e) => return refused(e),
     };
     // it hears from now what is wanted there, though it runs, and says its language, later
     let words = who.listening(town);
     let it = Join { town: town.clone(), resident: who.clone() };
-    // among what runs for it, so it ends as it goes, and no longer holds the town
-    let run = tokio::task::spawn_local(it.run(reach, body, words));
+    // among what runs for it, so it ends as it goes, and no longer keeps the town alive
+    let run = tokio::task::spawn_local(it.run(argv, body, words));
     let ends = Ends(run.abort_handle());
     town.runs(who.id, run);
-    town.joins.borrow_mut().insert(kind, Joined { who, _here: here, _run: ends });
+    town.joins
+        .borrow_mut()
+        .insert(kind, Joined { who, asked: Default::default(), _here: here, _run: ends });
     Ok(())
 }
 
@@ -155,17 +134,11 @@ struct Join {
 }
 
 impl Join {
-    /// From its start to its end. As it ends, its kind is let go, and its past `town/join` or
-    /// `town/connect` says how. One ended by a join again or a reopen says nothing: another stands
-    /// in its place, and one that joined again as a join ends would join without end.
-    async fn run(self, reach: Reach, body: Body, words: Listening) {
-        let (verb, (code, out)) = match reach {
-            Reach::Run(argv) => ("join", self.ran(&argv, words).await),
-            Reach::At(to) => match self.reached(&to, words).await {
-                Ok(()) => ("connect", (0, None)),
-                Err(e) => ("connect", (-1, Some(format!("cannot connect to {to}: {e}")))),
-            },
-        };
+    /// From its start to its end. As it ends, its kind is let go, and its past `town/join` says
+    /// how. One ended by a join again or a reopen says nothing: another stands in its place, and
+    /// one that joined again as a join ends would join without end.
+    async fn run(self, argv: Vec<String>, body: Body, words: Listening) {
+        let (code, out) = self.ran(&argv, words).await;
         let (town, who) = (&self.town, &self.resident);
         let at = who.at.as_deref().unwrap_or_default();
         // its own, taken out, so its kind is let go: the run that ends is this one, which waits
@@ -175,7 +148,7 @@ impl Join {
         drop(joined);
         // one that cannot start says why, as any resident that fails does
         if let Some(why) = &out {
-            town.error(who, Some(&format!("town/{verb}")), why.clone());
+            town.error(who, Some("town/join"), why.clone());
         }
         let body = answered(body, |m| {
             m.set("code", i64::from(code));
@@ -183,7 +156,7 @@ impl Join {
                 m.set("out", out);
             }
         });
-        town.talk(Word::new(format!("town/{verb}"), Tense::Past, body));
+        town.talk(Word::new("town/join", Tense::Past, body));
     }
 
     /// a program run, and talked with: how it ended
@@ -192,7 +165,7 @@ impl Join {
         // until it ends: one that stops saying is still told
         let who = &self.resident;
         let ran = Group::run(&self.town, who, argv, None, async |child, out, inp| {
-            self.converse(out, inp, words, Some(child.wait())).await;
+            self.converse(out, inp, words, crate::program::ends(&self.town, child)).await;
             child.wait().await
         });
         match ran.await {
@@ -201,40 +174,28 @@ impl Join {
         }
     }
 
-    /// a socket reached, and talked with, until it closes: a path, or a host:port
-    async fn reached(&self, to: &str, words: Listening) -> std::io::Result<()> {
-        if to.contains('/') {
-            let (r, w) = tokio::net::UnixStream::connect(to).await?.into_split();
-            self.converse(r, w, words, None::<std::future::Pending<()>>).await;
-        } else {
-            let (r, w) = tokio::net::TcpStream::connect(to).await?.into_split();
-            self.converse(r, w, words, None::<std::future::Pending<()>>).await;
-        }
-        Ok(())
-    }
-
-    /// Both ways at once, as any resident lives (`live`), in its language once it is said, until a
-    /// program ends or a socket hangs up.
+    /// Both ways at once, as any resident lives (`live`), in its language once it is said, until
+    /// the program ends.
     async fn converse(
         &self,
         out: impl AsyncRead + Unpin,
         mut inp: impl AsyncWrite + Unpin,
         words: Listening,
-        end: Option<impl std::future::Future>,
+        end: impl std::future::Future,
     ) {
         let town = &self.town;
-        let waits = async |m: &str| town.error(&self.resident, None, m.into());
+        let waits = async |m: &str| _ = town.notice(&self.resident, m.into());
         let (resident, voice) = (self.resident.clone(), Voice::new(out));
         let speaking = Life::speaking(town, resident, words, voice, waits);
         if let Some(resident) = speaking.await {
-            resident.live(town, &mut inp, end).await;
+            resident.live(town, &mut inp, Some(end)).await;
         }
     }
 }
 
 /// The caller's body with what town has to say of it, if it has parts to say it among: the
 /// caller's own fields ride back with the answer, so it can match on them (`on`'s `by`).
-fn answered(body: Body, say: impl FnOnce(&mut Parts)) -> Body {
+pub(crate) fn answered(body: Body, say: impl FnOnce(&mut Parts)) -> Body {
     match body.parts() {
         Parts::Map(_) => {
             let mut parts = body.parts().clone();
@@ -248,13 +209,19 @@ fn answered(body: Body, say: impl FnOnce(&mut Parts)) -> Body {
 /// What town keeps of `kind` in `tense`, said back with what was asked: the tense is when, as town
 /// keeps only facts. Present, the fact now; past, the facts before it, oldest first, as far as the
 /// log's tail; of a pattern (`kind/`, `/kind`, `/`), by kind. The future is not kept: it is heard.
-fn read(town: &Town, body: &Body) -> Result<Body, String> {
+/// Only what the asker `hears`: a kind it does not is refused, and a pattern keeps only those it
+/// does.
+pub(crate) fn read(town: &Town, body: &Body, hears: impl Fn(&str) -> bool) -> Result<Body, String> {
     let kind = body.part("kind").and_then(Parts::text).ok_or("a read names a `kind`")?;
     let tense = body.part("tense").and_then(Parts::text).unwrap_or("present");
     let one = is_kind(kind);
+    if one && !hears(kind) {
+        return Err(format!("`{kind}`: it reads only what it hears"));
+    }
     let read = match tense {
         "present" => {
-            let facts = town.facts(kind);
+            let mut facts = town.facts(kind);
+            facts.retain(|k, _| hears(k));
             match one {
                 true => facts.into_values().next().map_or(Parts::None, |b| b.parts().clone()),
                 false => {
@@ -265,7 +232,8 @@ fn read(town: &Town, body: &Body) -> Result<Body, String> {
         "past" => {
             let list =
                 |bodies: Vec<Body>| Parts::List(bodies.iter().map(|b| b.parts().clone()).collect());
-            let past = town.past(kind);
+            let mut past = town.past(kind);
+            past.retain(|k, _| hears(k));
             match one {
                 true => list(past.into_values().next().unwrap_or_default()),
                 false => Parts::Map(past.into_iter().map(|(k, b)| (k, list(b))).collect()),
@@ -277,39 +245,74 @@ fn read(town: &Town, body: &Body) -> Result<Body, String> {
     Ok(answered(body.clone(), |m| m.set("body", read)))
 }
 
-/// The time asked for, gone: said back as a past `town/after`, with everything the caller sent.
-async fn waited(town: Rc<Town>, wait: Duration, body: Body) {
-    tokio::time::sleep(wait).await;
-    town.talk(Word::new("town/after", Tense::Past, body));
-}
-
-/// A command run by the world's `sh`: the past `town/work` carries all it was asked with, `cmd`
-/// too, and what it said, how it ended, and its ms. One that cannot start says why, as a
+/// A program run to its end, as `argv` names it, in a group of its own as any program is: the past
+/// `town/work` carries all it was asked with, `argv` too, and what it said, how it ended, by its
+/// `code` or the `signal` that ended it, and its ms. A wait is one, `sleep`; a shell is one,
+/// `sh -c`. Each line on its stderr is a `town/error` from it. One that cannot start says why, as a
 /// `town/error` and in `out`, as a join does.
-async fn done(town: Rc<Town>, cmd: String, body: Body) {
-    let began = std::time::Instant::now();
-    let out = match crate::program::command(&town, &["sh", "-c", &cmd]) {
-        Ok(mut sh) => sh.output().await,
-        Err(e) => Err(e),
-    };
-    let ms = began.elapsed().as_millis() as u64;
-    let (code, stdout) = match out {
-        Ok(o) => (
-            o.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
-        ),
+async fn done(town: Rc<Town>, argv: Vec<String>, body: Body) {
+    use std::os::unix::process::ExitStatusExt;
+    use tokio::io::AsyncReadExt;
+    let began = town.moment();
+    let who = town.who(&argv[0], false);
+    // what it says, read as it says it, so it never waits to be read; then, once all it started
+    // has ended with it, what is left to read, and no more: one that left its group may hold its
+    // output open for ever, and is not waited for
+    let ran = Group::run(&town, &who, &argv, None, async |child, mut out, inp| {
+        drop(inp);
+        let (mut said, mut buf) = (Vec::new(), vec![0; 1 << 16]);
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => break status,
+                n = out.read(&mut buf) => match n {
+                    Ok(0) | Err(_) => break child.wait().await,
+                    Ok(n) => said.extend_from_slice(&buf[..n]),
+                },
+            }
+        };
+        (status, said, out)
+    })
+    .await;
+    let (code, signal, out) = match ran {
+        Ok((status, mut said, out)) => {
+            left(&out, &mut said);
+            let status = status.ok();
+            let code = status.and_then(|s| s.code()).unwrap_or(-1);
+            // as a shell's `$(…)` gives it: its last newlines let go, all else as it was said
+            let out = String::from_utf8_lossy(&said).trim_end_matches('\n').to_string();
+            (code, status.and_then(|s| s.signal()), out)
+        }
         Err(e) => {
-            let why = format!("cannot run sh: {e}");
+            let why = format!("cannot run {}: {e}", argv[0]);
             town.error(&Resident::town(), Some("town/work"), why.clone());
-            (-1, why)
+            (-1, None, why)
         }
     };
+    // by town's clock, as `when` is: a test's counts, so its ms is the same each run
+    let ms = town.moment().saturating_sub(began);
     let body = answered(body, |m| {
         m.set("code", i64::from(code));
-        m.set("out", stdout);
+        if let Some(signal) = signal {
+            m.set("signal", i64::from(signal));
+        }
+        m.set("out", out);
         m.set("ms", ms);
     });
     town.talk(Word::new("town/work", Tense::Past, body));
+}
+
+/// What is left to read of `out` now, without waiting: what was said before its sayers ended. Read
+/// through a copy of its descriptor, which shares its not waiting, so a read finds what is there,
+/// or that nothing is.
+fn left(out: &tokio::process::ChildStdout, said: &mut Vec<u8>) {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    let Ok(fd) = out.as_fd().try_clone_to_owned() else { return };
+    let mut out = std::fs::File::from(fd);
+    let mut buf = vec![0u8; 1 << 16];
+    while let Ok(n @ 1..) = out.read(&mut buf) {
+        said.extend_from_slice(&buf[..n]);
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +329,31 @@ mod tests {
         let town = Town::with_log(dir.log());
         let words = town.words.listen();
         (dir, town, words)
+    }
+
+    // a kind joined is its asker's: another that asks to join there is refused, and the first
+    // stays; its asker may join there again
+    #[test]
+    fn a_join_is_its_askers_alone() {
+        run(async {
+            let (_dir, town, mut words) = joining();
+            let a = Resident { kinds: vec!["x".into()], ..town.who("a", false) };
+            let b = Resident { kinds: vec!["x".into()], ..town.who("b", false) };
+            let (_a, _b) = (town.come(&a).unwrap(), town.come(&b).unwrap());
+            let ask = |who: &Resident| {
+                let body = Body::of(json!({ "as": "cat", "argv": ["cat"] }));
+                town.said(Word::new("town/join", Tense::Future, body), who);
+            };
+            ask(&a);
+            let first = town.joins.borrow()["cat"].who.id;
+            ask(&b);
+            let refused = until(&mut words, |w| w.kind == "town/join" && w.tense == Tense::Past);
+            assert!(refused.await.body.value()["out"].as_str().unwrap().contains("by another"));
+            assert_eq!(town.joins.borrow()["cat"].who.id, first, "the first stays");
+            ask(&a);
+            assert_ne!(town.joins.borrow()["cat"].who.id, first, "its asker may join again");
+            town.reopen();
+        });
     }
 
     /// what is wanted of a kind, as a resident asks it
@@ -405,7 +433,7 @@ mod tests {
             assert_eq!(ended.body.value()["code"], 4);
             join(json!(["sh", {}]), "odd");
             let bad = until(&mut words, |w| w.kind == "town/error").await;
-            assert_eq!(bad.body.value()["message"], "an `argv` is text and numbers");
+            assert_eq!(bad.body.value()["message"], "a join needs an `argv` of text and numbers");
             want(&town, "town/join", json!({ "as": "town/work", "argv": ["cat"] }));
             let bad = until(&mut words, |w| w.kind == "town/error").await;
             assert!(bad.body.value()["message"].as_str().unwrap().contains("town's own"));
@@ -414,8 +442,9 @@ mod tests {
     }
 
     // a join is told the facts at its kind, by their paths from it, and none beside it, then that
-    // what follows is now; what it says is said at its kind, and what names no kind is refused; it
-    // is told the future words there, and its stderr is heard, in its own time
+    // it is told first `now`, not what is at its kind, which it says itself; what it says is said
+    // at its kind, and what names no kind is refused; it is told the future words there, and its
+    // stderr is heard, in its own time
     #[test]
     fn a_join_speaks_at_its_kind() {
         run(async {
@@ -426,9 +455,7 @@ mod tests {
             // what it says, and, heard apart, since a pipe beside it keeps no order with it, what
             // it says aside
             let (mut words, mut aside) = (town.words.listen(), town.words.listen());
-            // what it is told, said back as it was told it: one told `box` would say `box/box`
-            let program = r#"read -r root; read -r x; read -r joined
-                printf '%s\n%s\n' "$root" "$x"
+            let program = r#"read -r joined
                 printf '{"kind":"../out","tense":"past","body":null}\n'
                 [ "$joined" = '{"kind":"","tense":"past","body":null}' ] &&
                   printf '{"kind":"joined","tense":"past","body":"yes"}\n'
@@ -437,8 +464,6 @@ mod tests {
                 while read -r told; do printf '%s\n' "$told" | sed 's/"future"/"past"/'; done"#;
             want(&town, "town/join", json!({ "as": "box", "argv": ["sh", "-c", program] }));
             let said = |kind: &'static str| move |w: &Word| w.kind == kind;
-            assert_eq!(until(&mut words, said("box")).await.body, Body::of(0i64));
-            assert_eq!(until(&mut words, said("box/x")).await.body, Body::of(1i64));
             let refused = until(&mut words, an_error("is no kind")).await;
             assert!(refused.body.value()["message"].as_str().unwrap().contains("`box/../out`"));
             assert_eq!(until(&mut words, said("box/joined")).await.body, Body::of("yes"));
@@ -462,23 +487,23 @@ mod tests {
         });
     }
 
-    // a join is told the present of its kind as it speaks, not before: one that says much before
-    // it reads, its greeting more than a pipe holds, is heard and told both
+    // a join is told what is wanted of it as it speaks, not before: one that says much before it
+    // reads, what waits for it more than a pipe contains, is heard and told both
     #[test]
     fn a_long_greeting_does_not_stop_a_join() {
         run(async {
             let (_dir, town, _) = joining();
             let long = "x".repeat(200);
-            for n in 0..2000 {
-                town.talk(Word::new(format!("big/{n}"), Tense::Present, Body::of(long.as_str())));
-            }
             let mut words = town.words.listen();
-            // 2000 lines said before one is read; then its greeting read, 2000 facts and `now`
+            // 2000 lines said before one is read; then what it is told read, `now` and 2000 wants
             let program = r#"i=0; while [ $i -lt 2000 ]; do
                   echo '{"kind":"said","tense":"past","body":null}'; i=$((i+1)); done
                 echo '{"kind":"done","tense":"past","body":null}'
                 head -n 2001 > /dev/null; echo '{"kind":"told","tense":"past","body":null}'"#;
             want(&town, "town/join", json!({ "as": "big", "argv": ["sh", "-c", program] }));
+            for n in 0..2000 {
+                want(&town, &format!("big/{n}"), json!(long));
+            }
             until(&mut words, |w| w.kind == "big/done").await;
             until(&mut words, |w| w.kind == "big/told").await;
             town.reopen();
@@ -575,53 +600,6 @@ mod tests {
         });
     }
 
-    // a socket reached says it is made, hears and is told in its language, and as the other end
-    // closes, the past `town/connect` says so; one that cannot be made says why
-    #[test]
-    fn a_socket_talks_until_it_closes() {
-        run(async {
-            let (dir, town, mut words) = joining();
-            said(&town, &dir).await;
-            let at = dir.join("socket");
-            let listener = tokio::net::UnixListener::bind(&at).unwrap();
-            // the other end: says hello, says back the first line it hears, and closes
-            tokio::task::spawn_local(async move {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-                let (conn, _) = listener.accept().await.unwrap();
-                let (r, mut w) = conn.into_split();
-                w.write_all(b"hello\n").await.unwrap();
-                let mut line = String::new();
-                tokio::io::BufReader::new(r).read_line(&mut line).await.unwrap();
-                w.write_all(format!("back {line}").as_bytes()).await.unwrap();
-            });
-            want(
-                &town,
-                "town/connect",
-                json!({ "as": "peer", "to": at, "speaks": "said", "about": "x" }),
-            );
-            let hello = until(&mut words, |w| w.kind == "peer").await;
-            assert_eq!(hello.body, Parts::from(json!({ "said": "hello" })));
-            want(&town, "peer", json!({ "said": "hi" }));
-            let back = until(&mut words, |w| w.kind == "peer" && w.tense == Tense::Past).await;
-            assert_eq!(back.body, Parts::from(json!({ "said": "back hi" })));
-            let ended =
-                until(&mut words, |w| w.kind == "town/connect" && w.tense == Tense::Past).await;
-            assert_eq!(
-                (ended.body.value()["about"].as_str(), ended.body.value()["code"].as_i64()),
-                (Some("x"), Some(0))
-            );
-            assert!(
-                town.may(&Word::new("peer", Tense::Past, Body::none()), &town.who("square", true))
-                    .is_ok(),
-                "let go as it ends"
-            );
-            want(&town, "town/connect", json!({ "as": "peer", "to": dir.join("none") }));
-            let ended =
-                until(&mut words, |w| w.kind == "town/connect" && w.tense == Tense::Past).await;
-            assert!(ended.body.value()["out"].as_str().unwrap().starts_with("cannot connect to"));
-        });
-    }
-
     // a join that ends as it waits for its language, having said what is not JSON, ends: its
     // kind is let go, and the past `town/join` says how
     #[test]
@@ -674,38 +652,8 @@ mod tests {
         });
     }
 
-    // a wait of any number of ms comes back, a float from a Lua division too; one without a
-    // number a clock can count, below 0 or too big, is an error, not silence or a panic
-    #[test]
-    fn a_wait_comes_back_or_says_why_not() {
-        run(async {
-            let (_dir, town, mut words) = joining();
-            want(&town, "town/after", json!({ "ms": 250.0 / 10.0, "about": "x" }));
-            want(&town, "town/after", json!({ "ms": -1 }));
-            want(&town, "town/after", json!({ "ms": 1e300 }));
-            // a last wait, of none: answered in order, so every refusal is said before it is back,
-            // whichever of the two waits is back first
-            want(&town, "town/after", json!({ "ms": 0, "about": "end" }));
-            let after = |about: &'static str| {
-                move |w: &Word| {
-                    w.kind == "town/after"
-                        && w.tense == Tense::Past
-                        && w.body.value()["about"] == about
-                }
-            };
-            let said = upto(&mut words, after("end")).await;
-            let refused = said
-                .iter()
-                .filter(|w| w.kind == "town/error" && w.body.value()["heard"] == "town/after");
-            if !said.iter().any(after("x")) {
-                until(&mut words, after("x")).await;
-            }
-            assert_eq!(refused.count(), 2, "below 0, and too big to count");
-        });
-    }
-
-    // a work that cannot start says why, as a join does, and its answer holds why, and all it
-    // was asked with, `cmd` too
+    // a work that cannot start says why, as a join does, and its answer says why, and all it
+    // was asked with, `argv` too
     #[test]
     fn a_work_that_cannot_start_says_why() {
         run(async {
@@ -713,21 +661,50 @@ mod tests {
             let world = [("PATH".into(), dir.as_os_str().into())].into_iter().collect();
             let town = Town::in_world(dir.log(), world);
             let mut words = town.words.listen();
-            want(&town, "town/work", json!({ "cmd": "true", "about": "x" }));
-            let why = "cannot run sh: sh is not on the world's PATH";
+            want(&town, "town/work", json!({ "argv": ["true"], "about": "x" }));
+            let why = "cannot run true: true is not on the world's PATH";
             let error = until(&mut words, an_error("cannot run")).await;
             assert_eq!(error.body.value()["message"], why);
             let past = |w: &Word| w.kind == "town/work" && w.tense == Tense::Past;
             let done = until(&mut words, past).await.body.value();
+            // its ms by the test's clock: begun, its error stamped, ended, two counts
             assert_eq!(
                 done,
-                json!({ "cmd": "true", "about": "x", "code": -1, "out": why, "ms": done["ms"] })
+                json!({ "argv": ["true"], "about": "x", "code": -1, "out": why, "ms": 2 })
             );
         });
     }
 
-    // a town runs in its world: its `sh` is the world's, so a command goes where the world says,
-    // here recorded, not run; its residents read the world's vars; and a join of what is not on
+    // a work ends as what it started ends: one that left its group, and holds its output open, is
+    // not waited for, and what was said before is kept
+    #[test]
+    fn a_work_ends_though_one_it_started_left() {
+        // the one that left, ended however the test ends
+        struct Left(std::path::PathBuf);
+        impl Drop for Left {
+            fn drop(&mut self) {
+                if let Some(pid) =
+                    std::fs::read_to_string(&self.0).ok().and_then(|p| p.trim().parse().ok())
+                {
+                    crate::unix::end_group(pid);
+                }
+            }
+        }
+        run(async {
+            let (dir, town, mut words) = joining();
+            let _left = Left(dir.join("pid"));
+            // `set -m`: what it starts is a job, in a group of its own, out of the work's
+            let left =
+                format!("set -m; sleep 30 & echo $! > {}; echo said", dir.join("pid").display());
+            want(&town, "town/work", json!({ "argv": ["sh", "-c", left] }));
+            let past = |w: &Word| w.kind == "town/work" && w.tense == Tense::Past;
+            let done = until(&mut words, past).await.body.value();
+            assert_eq!(done["out"], "said");
+        });
+    }
+
+    // a town runs in its world: a work runs the program the world's PATH finds, here one that
+    // records what it is given; its residents read the world's vars; and a join of what is not on
     // the world's PATH cannot start, and says so
     #[test]
     fn a_town_runs_in_its_world() {
@@ -736,20 +713,21 @@ mod tests {
             let dir = scratch();
             let bin = dir.join("bin");
             std::fs::create_dir(&bin).unwrap();
-            std::fs::write(bin.join("sh"), "#!/bin/sh\necho \"$@\" >> \"$HOME/ran\"\n").unwrap();
+            let notes = "#!/bin/sh\necho \"$@\" >> \"$HOME/ran\"\n";
+            std::fs::write(bin.join("notes"), notes).unwrap();
             let runs = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(bin.join("sh"), runs).unwrap();
+            std::fs::set_permissions(bin.join("notes"), runs).unwrap();
             let world = [("HOME", dir.as_os_str()), ("PATH", bin.as_os_str())];
             let world = world.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
             let town = Town::in_world(dir.log(), world);
             let mut words = town.words.listen();
-            want(&town, "town/work", json!({ "cmd": "tmux kill-session", "about": "x" }));
+            want(&town, "town/work", json!({ "argv": ["notes", "kill-session"], "about": "x" }));
             let past =
                 |kind: &'static str| move |w: &Word| w.kind == kind && w.tense == Tense::Past;
             let done = until(&mut words, past("town/work")).await;
             assert_eq!(done.body.value()["code"], 0);
             let ran = std::fs::read_to_string(dir.join("ran")).unwrap();
-            assert_eq!(ran, "-c tmux kill-session\n", "the world's sh, given the command");
+            assert_eq!(ran, "kill-session\n", "the world's, given what it was asked");
             // a Lua file, as `lua`, run in the world, reads it
             let env = dir.join("env.lua");
             let reads =
@@ -767,8 +745,9 @@ mod tests {
     }
 
     // a read is said back with what town keeps: the fact now, or the facts before it, oldest
-    // first, by kind for a pattern; the future is not kept; and one at the square may ask. Its
-    // answer is told to the asker alone: no other hears it, and the log holds none
+    // first, by kind for a pattern; the future is not kept; and one at the square may ask, of any
+    // kind. The ask is town's alone, and the answer the asker's: no other hears either, and the
+    // log keeps none
     #[test]
     fn a_read_is_what_town_keeps() {
         let (dir, town, mut words) = joining();
@@ -776,6 +755,7 @@ mod tests {
         say("box/a", 1);
         say("box/a", 2);
         say("box/b", 3);
+        say("other", 4);
         let asker = town.who("sq", true);
         let mut mine = asker.listening(&town);
         let other = Resident { kinds: vec!["/town/read".into()], ..town.who("other", true) };
@@ -800,13 +780,37 @@ mod tests {
         assert_eq!(read("box/", "present").1["body"], json!({ "box/a": 2, "box/b": 3 }));
         assert_eq!(read("box/a", "past").1["body"], json!([1, 2]), "oldest first");
         assert_eq!(read("box/", "past").1["body"], json!({ "box/a": [1, 2], "box/b": [3] }));
+        assert_eq!(read("other", "present").1["body"], json!(4), "what it does not hear, too");
         let (kind, refused) = read("box/a", "future");
         assert_eq!(kind, "town/error");
         assert!(refused["message"].as_str().unwrap().contains("not kept"));
-        let heard = |w: &Word| w.kind == "town/read" && w.tense == Tense::Past;
+        let heard = |w: &Word| w.kind == "town/read";
         assert!(!std::iter::from_fn(|| others.try_recv().ok()).any(|w| heard(&w)), "another");
         assert!(!std::iter::from_fn(|| words.try_recv().ok()).any(|w| heard(&w)), "nor all");
         let logged = std::fs::read_to_string(dir.log()).unwrap();
-        assert!(!logged.contains("town/read"), "the log holds none");
+        assert!(!logged.contains("town/read"), "the log keeps none");
+    }
+
+    // a town that comes by a name reads only what its name gives: a kind it does not hear is
+    // refused, and a pattern keeps only those it does
+    #[test]
+    fn a_visitor_reads_only_its_name() {
+        let dir = scratch();
+        let town = Town::with_log(dir.log());
+        let say = |kind: &str, n: i64| town.talk(Word::new(kind, Tense::Present, Body::of(n)));
+        say("box/a", 1);
+        say("other", 2);
+        let visitor = Resident { kinds: vec!["box/".into()], visitor: true, ..town.who("v", true) };
+        let mut told = visitor.listening(&town);
+        let mut read = |kind: &str| {
+            let asked = json!({ "kind": kind, "tense": "present" });
+            town.said(Word::new("town/read", Tense::Future, Body::of(asked)), &visitor);
+            let read = |w: &Word| w.kind == "town/read" || w.kind == crate::word::ERROR;
+            std::iter::from_fn(|| told.try_recv().ok()).find(read).expect("answered")
+        };
+        assert_eq!(read("/").body.value()["body"], json!({ "box/a": 1 }), "what it hears");
+        let refused = read("other");
+        assert_eq!(refused.kind, crate::word::ERROR, "not what it does not");
+        assert!(refused.body.value()["message"].as_str().unwrap().contains("reads only"));
     }
 }

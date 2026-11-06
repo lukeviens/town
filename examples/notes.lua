@@ -1,14 +1,15 @@
 -- notes: each note you add becomes a line in a file.
 --
 -- `mend` makes the file if it is missing, and `post` writes it whole, so no one reads half of it.
--- town's watch, a program joined by its path, `WATCH`, says the file as a fact whenever it
--- changes. `own` keeps `noted` for notes alone: no one else may say it.
+-- `mirror`, a program joined by its name, says the file as a fact whenever it changes. `own` keeps
+-- `noted` for notes alone: no one else may say it.
 --
---   town talk past note text="buy milk"     a line added to notes.txt, and the file said again
+--   printf 'past\tnote\ttext=buy milk\n' | town '{"speaks":"words"}'
+--                                  a line added to notes.txt, and the file said again
 
 local file = (os.getenv("TMPDIR") or "/tmp/"):gsub("/?$", "/") .. "notes.txt"
 mend(file, function() return "" end)
-talk(join("notes", { WATCH, file }))
+talk(join("notes", { "mirror", file }))
 
 local notes = react{
   on({ kind = "note", tense = "past" }, function(w)

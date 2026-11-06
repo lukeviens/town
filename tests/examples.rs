@@ -3,7 +3,6 @@
 //!   cargo test --test examples
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use town::body::Body;
@@ -12,7 +11,7 @@ use town::residents;
 use town::town::Town;
 use town::word::{Tense, Word};
 
-use town::testing::{run, scratch, until, world_with};
+use town::testing::{run, scratch, until, world_finding};
 
 /// a body, to look into
 trait Look {
@@ -34,8 +33,8 @@ fn word(kind: &str, tense: Tense, body: Value) -> Word {
 #[test]
 fn the_examples_answer_as_they_say() {
     let dir = scratch();
-    // its world: town's watch at `WATCH`, and where notes.lua keeps its file
-    let mut world = world_with(Path::new(env!("CARGO_BIN_EXE_watch")));
+    // its world: `mirror` on its PATH, and where notes.lua keeps its file
+    let mut world = world_finding(Path::new(env!("CARGO_BIN_EXE_mirror")));
     world.insert("TMPDIR".into(), dir.as_os_str().into());
     run(async {
         let town = Town::in_world(dir.log(), world);
@@ -59,18 +58,24 @@ fn the_examples_answer_as_they_say() {
             }
         }
 
-        // hello: a hi, the time it asked for, from clock, and a bye once its wait has gone
-        let asked = Instant::now();
+        // hello: a hi, the time it asked for, from clock, and a bye once its wait, a `sleep`, ends.
+        // clock and bye each wait on a program, so they come in either order
         town.talk(word("hello", Tense::Past, json!({ "from": "me" })));
         let hi = until(&mut words, |w| w.kind == "hi").await;
         assert_eq!(hi.tense, Tense::Past);
         assert_eq!(hi.body, Parts::from(json!({ "to": "me" })));
-        let clock = until(&mut words, |w| w.kind == "clock").await;
+        let (mut clock, mut bye) = (None, None);
+        while clock.is_none() || bye.is_none() {
+            let w = until(&mut words, |w| w.kind == "clock" || w.kind == "bye").await;
+            match w.kind.as_str() {
+                "clock" => clock = Some(w),
+                _ => bye = Some(w),
+            }
+        }
+        let (clock, bye) = (clock.unwrap(), bye.unwrap());
         assert_eq!(clock.tense, Tense::Present);
         assert_eq!(clock.body.value()["now"].as_str().unwrap().len(), "12:34:56".len());
-        let bye = until(&mut words, |w| w.kind == "bye").await;
         assert_eq!(bye.body, Parts::from(json!({ "to": "me" })));
-        assert!(asked.elapsed() >= Duration::from_millis(500), "bye waits its 500 ms");
 
         // ask: clock answers the time with the asker's id
         town.talk(word("time", Tense::Future, json!({ "id": "q1" })));

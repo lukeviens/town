@@ -1,90 +1,160 @@
-//! The log: each fact, on disk, and all that touches it. The README's *town*, the log.
+//! The log: each fact, kept, and all that touches it. The README's *town*, the log.
 //!
 //! - **as town starts**: folded into the present.
-//! - **as a fact is said**: appended, and the log compacted as it grows.
+//! - **as a fact is said**: appended; and the log compacted as a kind's owner keeps less of it.
+//! - **where**: in a store, which keeps its bytes in order: a file, as town's own is, or memory.
+//! - **in**: town's own language, as `voice::own` writes a word and `voice::owns` reads them.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::word::Word;
 
-/// Append a fact as one line, and how many bytes it took: none if it could not, which is said.
-pub fn append(path: &Path, word: &Word) -> u64 {
-    let line = crate::voice::line(word) + "\n";
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        Ok(mut past) => {
-            use std::io::Write;
-            if past.write_all(line.as_bytes()).is_err() {
-                eprintln!("town: past: append failed for '{}'", word.kind);
-                return 0;
-            }
-            line.len() as u64
-        }
-        Err(e) => {
-            eprintln!("town: past: cannot open {}: {e}", path.display());
-            0
-        }
-    }
+/// Where a log is kept: its bytes, in the order said. Town asks no more of it, and it knows nothing
+/// of words: a file is one, memory another.
+pub trait Store {
+    /// `bytes` added at the end
+    fn append(&self, bytes: &[u8]) -> std::io::Result<()>;
+    /// all it contains; none, if it contains nothing yet; or why it cannot be read
+    fn read(&self) -> std::io::Result<Vec<u8>>;
+    /// all it contains made `all`, at once: one who reads it after reads the old or the new, whole
+    fn replace(&self, all: &[u8]) -> std::io::Result<()>;
 }
 
-/// The whole log, line by line. A line that is not text, as one cut short, is read as best it can
-/// be: it is no word, and the lines around it stand.
-pub fn all(path: &Path) -> impl Iterator<Item = String> {
-    tail(path, u64::MAX)
-}
-
-/// The last `bytes` of the log, as whole lines. The window may begin inside a line, or inside a
-/// char, so its first line is left out, and its bytes are read as best they can be, never refused.
-pub fn tail(path: &Path, bytes: u64) -> impl Iterator<Item = String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut raw = Vec::new();
-    let mut from = 0;
-    if let Ok(mut f) = std::fs::File::open(path) {
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        from = len.saturating_sub(bytes);
-        let _ = f.seek(SeekFrom::Start(from));
-        let _ = f.read_to_end(&mut raw);
+/// A file: made as the first bytes are appended.
+impl Store for PathBuf {
+    fn append(&self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let at =
+            |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", self.display()));
+        let mut past =
+            std::fs::OpenOptions::new().create(true).append(true).open(self).map_err(at)?;
+        past.write_all(bytes).map_err(at)
     }
-    let mut buf = String::from_utf8_lossy(&raw).into_owned();
-    if from > 0 {
-        if let Some(nl) = buf.find('\n') {
-            // the first line is a part of one
-            buf.drain(..=nl);
+
+    // a file not made yet contains nothing; any other failure is no log, not an empty one
+    fn read(&self) -> std::io::Result<Vec<u8>> {
+        match std::fs::read(self) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            read => read,
         }
     }
-    buf.lines().map(str::to_string).collect::<Vec<_>>().into_iter()
-}
 
-/// Rewrite the log as its last `max_bytes`, after the present facts those lack: it stays bounded,
-/// holds the present, and keeps the recent past for `Town::past`.
-pub fn compact(path: &Path, present: &[Word], max_bytes: u64) {
-    let recent: Vec<String> = tail(path, max_bytes).collect();
-    let held: std::collections::HashSet<String> = recent
-        .iter()
-        .filter_map(|l| crate::voice::read(l).ok())
-        .filter(Word::is_fact)
-        .map(|w| w.kind)
-        .collect();
-    let head: String = present
-        .iter()
-        .filter(|w| !held.contains(&w.kind))
-        .map(|w| crate::voice::line(w) + "\n")
-        .collect();
-    let recent: String = recent.into_iter().map(|l| l + "\n").collect();
     // the log is the one copy of the present, and town may stop at any moment: the new log is
     // written beside it, then renamed over it at once
-    let mut tmp = path.to_path_buf().into_os_string();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let write = || -> std::io::Result<()> {
+    fn replace(&self, all: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(head.as_bytes())?;
-        f.write_all(recent.as_bytes())?;
-        f.sync_all()?; // on the disk before the rename, so the log is never half written
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
-        eprintln!("town: past: compaction failed for {} ({e}); log left intact", path.display());
-        let _ = std::fs::remove_file(&tmp); // no part of a log is left beside it
+        let mut tmp = self.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(all)?;
+            f.sync_all()?; // on the disk before the rename, so the log is never half written
+            std::fs::rename(&tmp, self)
+        };
+        write().inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp); // no part of a log is left beside it
+        })
     }
+}
+
+/// Memory: a log kept while it is held, and gone with it.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub struct Memory(std::cell::RefCell<Vec<u8>>);
+
+#[cfg(any(test, feature = "testing"))]
+impl Store for Memory {
+    fn append(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn read(&self) -> std::io::Result<Vec<u8>> {
+        Ok(self.0.borrow().clone())
+    }
+
+    fn replace(&self, all: &[u8]) -> std::io::Result<()> {
+        *self.0.borrow_mut() = all.to_vec();
+        Ok(())
+    }
+}
+
+/// A store held by more than one: a town, and one that opens the same log again.
+impl<S: Store> Store for Rc<S> {
+    fn append(&self, bytes: &[u8]) -> std::io::Result<()> {
+        (**self).append(bytes)
+    }
+
+    fn read(&self) -> std::io::Result<Vec<u8>> {
+        (**self).read()
+    }
+
+    fn replace(&self, all: &[u8]) -> std::io::Result<()> {
+        (**self).replace(all)
+    }
+}
+
+/// Append a fact, whole, and whether it could be: if not, that is said.
+pub fn append(store: &dyn Store, word: &Word) -> bool {
+    match store.append(&crate::voice::own(word)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("town: past: append failed for '{}': {e}", word.kind);
+            false
+        }
+    }
+}
+
+/// The words the log contains, in order, or why it cannot be read. What is no word is passed over,
+/// and the words around it stand.
+pub fn all(store: &dyn Store) -> std::io::Result<Vec<Word>> {
+    Ok(crate::voice::owns(&store.read()?).into_iter().filter_map(|(_, w)| w).collect())
+}
+
+/// The log as a town opens it: its words, once what it ends in that is no word, as a fact cut short
+/// as town stopped, is let go, so the next fact is not said after it as one. Why it cannot be read.
+pub fn open(store: &dyn Store) -> std::io::Result<Vec<Word>> {
+    let raw = store.read()?;
+    let units = crate::voice::owns(&raw);
+    match units.last() {
+        Some((cut, None)) => store.replace(&raw[..raw.len() - cut.len()])?,
+        // a word whole but for its line's end is ended, so the next is not said after it as one
+        Some((last, Some(_))) if !last.ends_with(b"\n") => store.append(b"\n")?,
+        _ => {}
+    }
+    Ok(units.into_iter().filter_map(|(_, w)| w).collect())
+}
+
+/// Rewrite the log as what `keeps` keeps: of each kind it names a number for, its last facts, that
+/// many and one, the present among them; of each other, all; in the order they were said, and no
+/// unit that is no word. How many facts of each kind it keeps then.
+pub fn compact(
+    store: &dyn Store,
+    keeps: impl Fn(&str) -> Option<u64>,
+) -> std::io::Result<HashMap<String, u64>> {
+    // one that cannot be read is left as it is: none is written over what is not known
+    let raw = store.read()?;
+    let words: Vec<(&[u8], Word)> =
+        crate::voice::owns(&raw).into_iter().filter_map(|(u, w)| Some((u, w?))).collect();
+    let mut left: HashMap<String, u64> = HashMap::new();
+    let mut kept = vec![false; words.len()];
+    for (i, (_, w)) in words.iter().enumerate().rev() {
+        let n = left.entry(w.kind.clone()).or_insert(0);
+        if keeps(&w.kind).is_none_or(|keep| *n <= keep) {
+            *n += 1;
+            kept[i] = true;
+        }
+    }
+    let all: Vec<u8> = words
+        .iter()
+        .zip(kept)
+        .filter(|(_, k)| *k)
+        .flat_map(|((u, _), _)| u.iter())
+        .copied()
+        .collect();
+    store.replace(&all)?;
+    Ok(left)
 }
